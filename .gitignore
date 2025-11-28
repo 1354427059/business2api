@@ -1,0 +1,31 @@
+# Binaries
+gemini-gateway
+gemini-gateway.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Data
+data/
+*.json
+!config.json.example
+!package.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/

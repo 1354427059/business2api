@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# Data
+data/
+*.json
+!config.json.example
+
+# Node (not needed for Go build)
+node_modules/
+main.js
+package.json
+package-lock.json
+
+# IDE
+.idea/
+.vscode/
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Documentation
+README.md
+LICENSE
+
+# GitHub
+.github/
