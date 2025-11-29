@@ -255,10 +255,15 @@ async function runTask(threadId, config) {
         }
         
         if (!quietMode) console.log(`[线程 ${threadId}] 正在启动浏览器...`);
-        browser = await puppeteer.launch({
+        const launchOptions = {
             headless: config.headless ? 'new' : false,
             args: launchArgs
-        });
+        };
+        // 支持环境变量指定 Chromium 路径（Docker 中使用）
+        if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+            launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+        }
+        browser = await puppeteer.launch(launchOptions);
 
         // 获取默认页面（避免打开两个窗口）
         const pages = await browser.pages();

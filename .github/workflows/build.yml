@@ -44,11 +44,17 @@ jobs:
           fi
           CGO_ENABLED=0 go build -ldflags="-s -w" -o business2api-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} .
 
+      - name: Prepare package
+        run: |
+          mkdir -p dist
+          mv business2api-* dist/
+          cp main.js package.json config.json.example dist/
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: business2api-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: business2api-*
+          path: dist/*
 
   docker:
     runs-on: ubuntu-latest
@@ -113,14 +119,23 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release
-          find artifacts -type f -name 'business2api-*' -exec cp {} release/ \;
-          cd release
-          for f in business2api-*; do
-            if [[ ! "$f" == *.exe ]]; then
-              chmod +x "$f"
-            fi
-            tar -czvf "${f}.tar.gz" "$f" && rm "$f" || true
+          for dir in artifacts/business2api-*/; do
+            # 获取平台名称
+            platform=$(basename "$dir")
+            # 创建临时目录
+            mkdir -p "tmp/$platform"
+            cp "$dir"/* "tmp/$platform/"
+            # 设置可执行权限
+            for f in "tmp/$platform"/business2api-*; do
+              if [[ ! "$f" == *.exe ]]; then
+                chmod +x "$f"
+              fi
+            done
+            # 打包
+            tar -czvf "release/${platform}.tar.gz" -C tmp "$platform"
+            rm -rf "tmp/$platform"
           done
+          rm -rf tmp
 
       - name: Create Release
         uses: softprops/action-gh-release@v1

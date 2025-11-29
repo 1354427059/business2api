@@ -21,11 +21,29 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# Install ca-certificates for HTTPS requests
-RUN apk add --no-cache ca-certificates tzdata
+# Install runtime dependencies: ca-certificates, tzdata, nodejs, npm, chromium
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    nodejs \
+    npm \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ttf-freefont \
+    font-noto-cjk
+
+# Set Puppeteer to use system Chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 # Copy binary from builder
 COPY --from=builder /app/business2api .
+
+# Copy JS registration script and install dependencies
+COPY main.js package.json ./
+RUN npm install --production && npm cache clean --force
 
 # Copy config template (optional)
 COPY config.json.example ./config.json.example

@@ -344,6 +344,15 @@ func (p *AccountPool) refreshWorker(id int) {
 			time.Sleep(time.Second)
 			continue
 		}
+
+		// 检查冷却，避免频繁刷新
+		if time.Since(acc.LastRefresh) < refreshCooldown {
+			// 冷却中，直接放回 ready 队列
+			acc.Refreshed = true
+			p.MarkReady(acc)
+			continue
+		}
+
 		acc.JWTExpires = time.Time{}
 		if err := acc.RefreshJWT(); err != nil {
 			// 只有账号失效（401/403）才删除，其他错误放回队列重试
@@ -351,7 +360,8 @@ func (p *AccountPool) refreshWorker(id int) {
 				log.Printf("❌ [worker-%d] [%s] %v", id, acc.Data.Email, err)
 				p.RemoveAccount(acc)
 			} else if strings.Contains(err.Error(), "刷新冷却中") {
-				// 冷却中，直接放回 ready 队列，等待下次刷新周期
+				// 冷却中，直接放回 ready 队列
+				acc.Refreshed = true
 				p.MarkReady(acc)
 			} else {
 				log.Printf("⚠️ [worker-%d] [%s] 刷新失败: %v，稍后重试", id, acc.Data.Email, err)
@@ -389,12 +399,31 @@ func (p *AccountPool) RefreshAllAccounts() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	var stillReady []*Account
+	refreshed := 0
+	skipped := 0
+
 	for _, acc := range p.readyAccounts {
+		// 检查是否在冷却中
+		if time.Since(acc.LastRefresh) < refreshCooldown {
+			// 冷却中，保留在 ready 队列
+			stillReady = append(stillReady, acc)
+			skipped++
+			continue
+		}
+
+		// 未冷却，移入 pending 队列刷新
 		acc.Refreshed = false
 		acc.JWTExpires = time.Time{}
 		p.pendingAccounts = append(p.pendingAccounts, acc)
+		refreshed++
 	}
-	p.readyAccounts = nil
+
+	p.readyAccounts = stillReady
+
+	if refreshed > 0 || skipped > 0 {
+		log.Printf("🔄 周期刷新: %d 个账号加入刷新队列, %d 个账号冷却中跳过", refreshed, skipped)
+	}
 }
 func (p *AccountPool) PendingCount() int {
 	p.mu.RLock()
