@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	_ "image/gif"
+	_ "image/jpeg"
 	"image/png"
 	"io"
 	"log"
@@ -21,6 +23,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -1214,22 +1219,31 @@ func parseMessageContent(msg Message) (string, []ImageInfo) {
 							if len(parts) == 2 {
 								mimeType := "image/jpeg"
 								base64Data := parts[1]
+								needConvert := false
+								origFormat := ""
+
 								if strings.Contains(parts[0], "image/png") {
 									mimeType = "image/png"
-								} else if strings.Contains(parts[0], "image/gif") {
-									mimeType = "image/gif"
-								} else if strings.Contains(parts[0], "image/webp") {
-									// webp 需要转换为 PNG
+								} else if strings.Contains(parts[0], "image/jpeg") {
+									mimeType = "image/jpeg"
+								} else {
+									// 其他格式都需要转换为 PNG
+									needConvert = true
+									origFormat = parts[0]
+								}
+
+								if needConvert {
 									converted, err := convertBase64ToPNG(base64Data)
 									if err != nil {
-										log.Printf("⚠️ webp base64 转换失败: %v", err)
-										mimeType = "image/webp" // 回退，可能会失败
+										log.Printf("⚠️ %s base64 转换失败: %v", origFormat, err)
+										// 回退到原格式，可能会失败
 									} else {
-										log.Printf("✅ webp base64 已转换为 PNG")
+										log.Printf("✅ %s base64 已转换为 PNG", origFormat)
 										base64Data = converted
 										mimeType = "image/png"
 									}
 								}
+
 								images = append(images, ImageInfo{
 									MimeType: mimeType,
 									Data:     base64Data,
@@ -1269,13 +1283,14 @@ func downloadImage(urlStr string) (string, string, error) {
 		mimeType = "image/jpeg"
 	}
 
-	// 转换不支持的格式（webp）为 PNG
-	if strings.Contains(mimeType, "webp") {
+	// 只有 jpeg 和 png 是支持的格式，其他都需要转换
+	needConvert := !strings.Contains(mimeType, "jpeg") && !strings.Contains(mimeType, "png")
+	if needConvert {
 		converted, err := convertToPNG(data)
 		if err != nil {
-			log.Printf("⚠️ webp 转换失败: %v，尝试原格式", err)
+			log.Printf("⚠️ %s 转换失败: %v，尝试原格式", mimeType, err)
 		} else {
-			log.Printf("✅ webp 已转换为 PNG")
+			log.Printf("✅ %s 已转换为 PNG", mimeType)
 			return base64.StdEncoding.EncodeToString(converted), "image/png", nil
 		}
 	}
