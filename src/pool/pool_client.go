@@ -33,6 +33,7 @@ var (
 	RunBrowserRegister RunBrowserRegisterFunc
 	ClientHeadless     bool
 	ClientProxy        string
+	GetClientProxy     func() string // 获取代理的函数
 )
 
 // PoolClient 号池客户端
@@ -259,7 +260,13 @@ func (pc *PoolClient) handleRegisterTask(data map[string]interface{}) {
 	logger.Info("收到注册任务: %d 个账号", count)
 
 	for i := 0; i < count; i++ {
-		result := RunBrowserRegister(ClientHeadless, ClientProxy, i)
+		// 获取代理（优先使用代理池）
+		currentProxy := ClientProxy
+		if GetClientProxy != nil {
+			currentProxy = GetClientProxy()
+		}
+		logger.Info("[注册 %d] 使用代理: %s", i, currentProxy)
+		result := RunBrowserRegister(ClientHeadless, currentProxy, i)
 
 		if result.Success {
 			// 上传账号到服务器
@@ -326,15 +333,32 @@ func (pc *PoolClient) handleRefreshTask(data map[string]interface{}) {
 
 	if result.Success {
 		logger.Info("✅ 账号续期成功: %s", email)
+
+		// 使用刷新后的新值（如果有的话）
+		authorization := acc.Data.Authorization
+		if result.Authorization != "" {
+			authorization = result.Authorization
+		}
+		configID := acc.ConfigID
+		if result.ConfigID != "" {
+			configID = result.ConfigID
+		}
+		csesidx := acc.CSESIDX
+		if result.CSESIDX != "" {
+			csesidx = result.CSESIDX
+		}
+
 		// 上传更新后的账号数据到服务器
 		uploadReq := &AccountUploadRequest{
 			Email:         email,
 			Cookies:       result.SecureCookies,
-			Authorization: acc.Data.Authorization,
-			ConfigID:      acc.ConfigID,
-			CSESIDX:       acc.CSESIDX,
+			Authorization: authorization,
+			ConfigID:      configID,
+			CSESIDX:       csesidx,
 			IsNew:         false,
 		}
+		logger.Info("[%s] 上传续期数据: configID=%s, csesidx=%s, auth长度=%d",
+			email, configID, csesidx, len(authorization))
 		if err := pc.uploadAccountData(uploadReq); err != nil {
 			logger.Warn("上传续期数据失败: %v", err)
 		}

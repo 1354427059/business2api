@@ -29,6 +29,7 @@ import (
 	"business2api/src/flow"
 	"business2api/src/logger"
 	"business2api/src/pool"
+	"business2api/src/proxy"
 	"business2api/src/register"
 )
 
@@ -59,16 +60,27 @@ type FlowConfigSection struct {
 	MaxPollAttempts int      `json:"max_poll_attempts"` // 最大轮询次数
 }
 
+// ProxyConfig 代理配置
+type ProxyConfig struct {
+	Proxy          string   `json:"proxy"`            // 单个代理 (http/socks5)
+	Subscribes     []string `json:"subscribes"`       // 订阅链接列表
+	Files          []string `json:"files"`            // 代理文件列表
+	HealthCheck    bool     `json:"health_check"`     // 是否启用健康检查
+	CheckOnStartup bool     `json:"check_on_startup"` // 启动时检查
+}
+
 type AppConfig struct {
-	APIKeys       []string              `json:"api_keys"`       // API 密钥列表
-	ListenAddr    string                `json:"listen_addr"`    // 监听地址
-	DataDir       string                `json:"data_dir"`       // 数据目录
-	Pool          PoolConfig            `json:"pool"`           // 号池配置
-	Proxy         string                `json:"proxy"`          // 代理
-	DefaultConfig string                `json:"default_config"` // 默认 configId
-	PoolServer    pool.PoolServerConfig `json:"pool_server"`    // 号池服务器配置
-	Debug         bool                  `json:"debug"`          // 调试模式
-	Flow          FlowConfigSection     `json:"flow"`           // Flow 配置
+	APIKeys        []string              `json:"api_keys"`        // API 密钥列表
+	ListenAddr     string                `json:"listen_addr"`     // 监听地址
+	DataDir        string                `json:"data_dir"`        // 数据目录
+	Pool           PoolConfig            `json:"pool"`            // 号池配置
+	Proxy          string                `json:"proxy"`           // 代理 (兼容旧配置)
+	ProxySubscribe string                `json:"proxy_subscribe"` // 代理订阅链接 (兼容旧配置)
+	ProxyPool      ProxyConfig           `json:"proxy_pool"`      // 代理池配置
+	DefaultConfig  string                `json:"default_config"`  // 默认 configId
+	PoolServer     pool.PoolServerConfig `json:"pool_server"`     // 号池服务器配置
+	Debug          bool                  `json:"debug"`           // 调试模式
+	Flow           FlowConfigSection     `json:"flow"`            // Flow 配置
 }
 
 // PoolMode 号池模式
@@ -189,6 +201,9 @@ func loadAppConfig() {
 	register.Headless = appConfig.Pool.RegisterHeadless
 	register.Proxy = Proxy
 
+	// 初始化代理池
+	initProxyPool()
+
 	if pool.EnableBrowserRefresh && pool.BrowserRefreshMaxRetry > 0 {
 		logger.Info("🌐 浏览器刷新已启用 (headless=%v, 最大重试=%d)", pool.BrowserRefreshHeadless, pool.BrowserRefreshMaxRetry)
 	} else if pool.EnableBrowserRefresh {
@@ -232,7 +247,55 @@ func initFlowClient() {
 	logger.Info("📹 Flow 服务已启用，共 %d 个 Token", len(appConfig.Flow.Tokens))
 }
 
-var FixedModels = []string{
+// initProxyPool 初始化代理池 (内置 xray-core)
+func initProxyPool() {
+	// 添加订阅链接（新配置）
+	for _, sub := range appConfig.ProxyPool.Subscribes {
+		proxy.Manager.AddSubscribeURL(sub)
+	}
+	// 兼容旧配置
+	if appConfig.ProxySubscribe != "" {
+		proxy.Manager.AddSubscribeURL(appConfig.ProxySubscribe)
+	}
+
+	// 添加代理文件
+	for _, file := range appConfig.ProxyPool.Files {
+		proxy.Manager.AddProxyFile(file)
+	}
+	if err := proxy.Manager.LoadAll(); err != nil {
+		logger.Warn("⚠️ 加载代理失败: %v", err)
+	}
+
+	// 当有代理配置时，默认开启健康检查（除非明确关闭）
+	hasProxyConfig := len(appConfig.ProxyPool.Subscribes) > 0 || len(appConfig.ProxyPool.Files) > 0 || appConfig.ProxySubscribe != ""
+	shouldHealthCheck := hasProxyConfig || appConfig.ProxyPool.HealthCheck
+
+	if shouldHealthCheck && appConfig.ProxyPool.CheckOnStartup {
+		logger.Info("🔍 开始代理健康检查...")
+		proxy.Manager.CheckAllHealth()
+	}
+	if proxy.Manager.TotalCount() == 0 {
+		if appConfig.ProxyPool.Proxy != "" {
+			proxy.Manager.SetProxies([]string{appConfig.ProxyPool.Proxy})
+		} else if Proxy != "" {
+			proxy.Manager.SetProxies([]string{Proxy})
+		}
+	}
+	if proxy.Manager.TotalCount() > 0 {
+		proxy.Manager.StartAutoUpdate()
+		logger.Info("✅ 代理池已初始化: %d 个节点, %d 个健康",
+			proxy.Manager.TotalCount(), proxy.Manager.HealthyCount())
+	}
+	register.GetProxy = func() string {
+		if proxy.Manager.Count() > 0 {
+			return proxy.Manager.Next()
+		}
+		return Proxy
+	}
+}
+
+// BaseModels 基础模型（始终可用）
+var BaseModels = []string{
 	// Gemini 文本模型
 	"gemini-2.5-flash",
 	"gemini-2.5-pro",
@@ -253,6 +316,8 @@ var FixedModels = []string{
 	"gemini-2.5-pro-search",
 	"gemini-3-pro-preview-search",
 	"gemini-3-pro-search",
+}
+var FlowModels = []string{
 	// Flow 图片生成模型
 	"gemini-2.5-flash-image-landscape",
 	"gemini-2.5-flash-image-portrait",
@@ -277,6 +342,16 @@ var FixedModels = []string{
 	// Flow 多图生成视频 (R2V)
 	"veo_3_0_r2v_fast_portrait",
 	"veo_3_0_r2v_fast_landscape",
+}
+
+// GetAvailableModels 获取当前可用的模型列表
+func GetAvailableModels() []string {
+	if flowHandler != nil {
+		// Flow 已启用，返回全部模型
+		return append(BaseModels, FlowModels...)
+	}
+	// Flow 未启用，只返回基础模型
+	return BaseModels
 }
 
 // 模型名称映射到 Google API 的 modelId
@@ -1113,7 +1188,7 @@ func handleGeminiGenerate(c *gin.Context) {
 	}
 
 	if model == "" {
-		model = FixedModels[0]
+		model = GetAvailableModels()[0]
 	}
 
 	var geminiReq GeminiRequest
@@ -1240,7 +1315,7 @@ func handleClaudeMessages(c *gin.Context) {
 	}
 
 	if req.Model == "" {
-		req.Model = FixedModels[0]
+		req.Model = GetAvailableModels()[0]
 	}
 
 	streamChat(c, req)
@@ -2317,6 +2392,12 @@ func runAsClient() {
 	}
 	pool.ClientHeadless = appConfig.Pool.RegisterHeadless
 	pool.ClientProxy = Proxy
+	pool.GetClientProxy = func() string {
+		if proxy.Manager.Count() > 0 {
+			return proxy.Manager.Next()
+		}
+		return Proxy
+	}
 
 	client := pool.NewPoolClient(appConfig.PoolServer)
 	if err := client.Start(); err != nil {
@@ -2451,7 +2532,7 @@ func setupAPIRoutes(r *gin.Engine) {
 	// Gemini 风格模型列表 /v1beta/models
 	apiGroup.GET("/v1beta/models", func(c *gin.Context) {
 		var models []gin.H
-		for _, m := range FixedModels {
+		for _, m := range GetAvailableModels() {
 			models = append(models, gin.H{
 				"name":                       "models/" + m,
 				"version":                    "001",
@@ -2472,7 +2553,7 @@ func setupAPIRoutes(r *gin.Engine) {
 	apiGroup.GET("/v1/models", func(c *gin.Context) {
 		now := time.Now().Unix()
 		var models []gin.H
-		for _, m := range FixedModels {
+		for _, m := range GetAvailableModels() {
 			models = append(models, gin.H{
 				"id":         m,
 				"object":     "model",
@@ -2491,7 +2572,7 @@ func setupAPIRoutes(r *gin.Engine) {
 			return
 		}
 		if req.Model == "" {
-			req.Model = FixedModels[0]
+			req.Model = GetAvailableModels()[0]
 		}
 		streamChat(c, req)
 	})
@@ -2506,7 +2587,7 @@ func setupAPIRoutes(r *gin.Engine) {
 
 		// 检查模型是否存在
 		found := false
-		for _, m := range FixedModels {
+		for _, m := range GetAvailableModels() {
 			if m == modelName {
 				found = true
 				break
@@ -2649,16 +2730,27 @@ func setupAPIRoutes(r *gin.Engine) {
 			result := register.RefreshCookieWithBrowser(targetAcc, pool.BrowserRefreshHeadless, Proxy)
 			if result.Success {
 				targetAcc.Mu.Lock()
+				// 更新完整信息
 				targetAcc.Data.Cookies = result.SecureCookies
+				if result.Authorization != "" {
+					targetAcc.Data.Authorization = result.Authorization
+				}
 				if result.CSESIDX != "" {
 					targetAcc.CSESIDX = result.CSESIDX
 					targetAcc.Data.CSESIDX = result.CSESIDX
 				}
+				if result.ConfigID != "" {
+					targetAcc.ConfigID = result.ConfigID
+					targetAcc.Data.ConfigID = result.ConfigID
+				}
+				targetAcc.Data.Timestamp = time.Now().Format(time.RFC3339)
 				targetAcc.FailCount = 0
 				targetAcc.Mu.Unlock()
 
 				if err := targetAcc.SaveToFile(); err != nil {
-					log.Printf("❌ [%s] 保存刷新后的Cookie失败: %v", req.Email, err)
+					log.Printf("❌ [%s] 保存刷新后的数据失败: %v", req.Email, err)
+				} else {
+					log.Printf("✅ [%s] 刷新数据已保存到文件", req.Email)
 				}
 				pool.Pool.MarkNeedsRefresh(targetAcc)
 				log.Printf("✅ 手动浏览器刷新成功: %s", req.Email)

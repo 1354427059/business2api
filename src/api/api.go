@@ -40,10 +40,6 @@ var (
 	StreamChat  func(c *gin.Context, req ChatRequest)
 	FixedModels []string
 )
-
-// ==================== Gemini API 兼容 ====================
-
-// GeminiRequest Gemini generateContent API 请求格式
 type GeminiRequest struct {
 	Contents          []GeminiContent          `json:"contents"`
 	SystemInstruction *GeminiContent           `json:"systemInstruction,omitempty"`
@@ -66,10 +62,7 @@ type GeminiInlineData struct {
 	Data     string `json:"data"`
 }
 
-// handleGeminiGenerate 处理Gemini generateContent API格式的请求
-// 支持路径格式: /v1beta/models/{model}:generateContent, /v1beta/models/{model}:streamGenerateContent
 func HandleGeminiGenerate(c *gin.Context) {
-	// action 格式: /{model}:generateContent 或 /{model}:streamGenerateContent
 	action := c.Param("action")
 	if action == "" {
 		c.JSON(400, gin.H{"error": gin.H{"code": 400, "message": "Missing model action", "status": "INVALID_ARGUMENT"}})
@@ -114,8 +107,6 @@ func HandleGeminiGenerate(c *gin.Context) {
 			messages = append(messages, Message{Role: "system", Content: sysText})
 		}
 	}
-
-	// 处理contents
 	for _, content := range geminiReq.Contents {
 		role := content.Role
 		if role == "model" {
@@ -151,8 +142,6 @@ func HandleGeminiGenerate(c *gin.Context) {
 
 	// 流式判断：路径中包含streamGenerateContent 或 query参数 alt=sse
 	stream := isStream || c.Query("alt") == "sse"
-
-	// 转换Gemini工具格式
 	var tools []ToolDef
 	for _, gt := range geminiReq.GeminiTools {
 		if funcDecls, ok := gt["functionDeclarations"].([]interface{}); ok {
@@ -193,8 +182,6 @@ type ClaudeRequest struct {
 	Temperature float64   `json:"temperature,omitempty"`
 	Tools       []ToolDef `json:"tools,omitempty"`
 }
-
-// handleClaudeMessages 处理Claude Messages API格式的请求
 func HandleClaudeMessages(c *gin.Context) {
 	var claudeReq ClaudeRequest
 	if err := c.ShouldBindJSON(&claudeReq); err != nil {
@@ -209,8 +196,6 @@ func HandleClaudeMessages(c *gin.Context) {
 		Temperature: claudeReq.Temperature,
 		Tools:       claudeReq.Tools,
 	}
-
-	// 如果Claude格式有单独的system字段，插入到messages开头
 	if claudeReq.System != "" {
 		systemMsg := Message{Role: "system", Content: claudeReq.System}
 		req.Messages = append([]Message{systemMsg}, req.Messages...)

@@ -12,6 +12,7 @@ RUN go mod download
 
 # Copy source code
 COPY *.go ./
+COPY src/ ./src/
 
 # Build binary
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o business2api .

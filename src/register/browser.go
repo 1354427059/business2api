@@ -1,6 +1,7 @@
 package register
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -21,12 +22,14 @@ import (
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/go-rod/stealth"
 )
 
 var (
 	RegisterDebug bool
 	RegisterOnce  bool
 	httpClient    *http.Client
+	GetProxy      func() string // 获取代理的函数，由 main 包设置
 	firstNames    = []string{"John", "Jane", "Michael", "Sarah", "David", "Emily", "Robert", "Lisa", "James", "Emma"}
 	lastNames     = []string{"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Wilson", "Taylor"}
 	commonWords   = map[string]bool{
@@ -589,12 +592,23 @@ func handleAdditionalSteps(page *rod.Page, threadID int) bool {
 	retryResult, _ := page.Eval(`() => {
 		const pageText = document.body ? document.body.innerText : '';
 		if (pageText.includes('出了点问题') || pageText.includes('Something went wrong') || 
-			pageText.includes('error') || pageText.includes('错误')) {
-			// 查找重试按钮
+			pageText.includes('went wrong')) {
+			// 查找重试按钮 - 优先使用 mdc-button__label
+			const tryAgainLabel = document.querySelector('.mdc-button__label');
+			if (tryAgainLabel && (tryAgainLabel.textContent.includes('Try again') || 
+				tryAgainLabel.textContent.includes('重试') || tryAgainLabel.textContent.includes('再试'))) {
+				const btn = tryAgainLabel.closest('button');
+				if (btn) {
+					btn.click();
+					return { clicked: true, action: 'retry_mdc' };
+				}
+			}
+			// 备用：查找所有按钮
 			const buttons = document.querySelectorAll('button');
 			for (const btn of buttons) {
 				const text = btn.textContent || '';
-				if (text.includes('重试') || text.includes('Retry') || text.includes('再试')) {
+				if (text.includes('重试') || text.includes('Retry') || text.includes('再试') || 
+					text.includes('Try again') || text.includes('try again')) {
 					btn.click();
 					return { clicked: true, action: 'retry' };
 				}
@@ -790,7 +804,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		log.Printf("[注册 %d] ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", threadID)
 	}
 
-	// 设置启动参数（兼容更多环境）
+	// 设置启动参数（兼容更多环境 + 反自动化检测）
 	l = l.Headless(headless).
 		Set("no-sandbox").
 		Set("disable-setuid-sandbox").
@@ -800,7 +814,13 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		Set("disable-blink-features", "AutomationControlled").
 		Set("window-size", "1280,800").
 		Set("lang", "zh-CN").
-		Set("disable-extensions")
+		Set("disable-extensions").
+		// 额外的反检测参数
+		Set("excludeSwitches", "enable-automation").
+		Set("useAutomationExtension", "false").
+		Set("disable-infobars").
+		Set("disable-automation").
+		Delete("enable-automation")
 
 	if proxy != "" {
 		l = l.Proxy(proxy)
@@ -821,31 +841,14 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 	browser = browser.Timeout(120 * time.Second)
 
-	// 获取默认页面
-	pages, err := browser.Pages()
+	// 使用 stealth 创建页面（绕过自动化检测）
+	page, err := stealth.Page(browser)
 	if err != nil {
-		result.Error = fmt.Errorf("获取页面列表失败: %w", err)
+		result.Error = fmt.Errorf("创建 stealth 页面失败: %w", err)
 		return result
 	}
 
-	var page *rod.Page
-	if len(pages) > 0 {
-		page = pages[0]
-	} else {
-		page, err = browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
-		if err != nil {
-			result.Error = fmt.Errorf("创建新页面失败: %w", err)
-			return result
-		}
-	}
-
-	// 确保 page 不为 nil
-	if page == nil {
-		result.Error = fmt.Errorf("无法获取或创建浏览器页面")
-		return result
-	}
-
-	// 设置视口和 User-Agent
+	// 设置视口
 	if err := page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
 		Width:  1280,
 		Height: 800,
@@ -853,11 +856,40 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		log.Printf("[注册 %d] ⚠️ 设置视口失败: %v", threadID, err)
 	}
 
-	if err := page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
-		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	}); err != nil {
-		log.Printf("[注册 %d] ⚠️ 设置 User-Agent 失败: %v", threadID, err)
-	}
+	// 注入额外的反检测脚本
+	_, _ = page.Eval(`() => {
+		// 覆盖 navigator.webdriver
+		Object.defineProperty(navigator, 'webdriver', {
+			get: () => undefined
+		});
+		
+		// 覆盖 chrome 自动化标识
+		if (window.chrome) {
+			window.chrome.runtime = undefined;
+		}
+		
+		// 覆盖 permissions
+		const originalQuery = window.navigator.permissions.query;
+		window.navigator.permissions.query = (parameters) => (
+			parameters.name === 'notifications' ?
+				Promise.resolve({ state: Notification.permission }) :
+				originalQuery(parameters)
+		);
+		
+		// 模拟真实的 plugins
+		Object.defineProperty(navigator, 'plugins', {
+			get: () => [
+				{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+				{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+				{ name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+			]
+		});
+		
+		// 模拟真实的 languages
+		Object.defineProperty(navigator, 'languages', {
+			get: () => ['zh-CN', 'zh', 'en-US', 'en']
+		});
+	}`)
 
 	// 监听请求以捕获 authorization
 	var authorization string
@@ -893,95 +925,110 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	// 查找并输入邮箱
 	log.Printf("[注册 %d] 准备输入邮箱: %s", threadID, email)
 
-	// 查找邮箱输入框（支持多种选择器）
-	inputResult, _ := page.Eval(`() => {
-		// 尝试多种选择器
-		const selectors = [
-			'input[type="email"]',
-			'input[name="identifier"]',
-			'input[autocomplete="email"]',
-			'input[autocomplete="username"]',
-			'input:not([type="hidden"]):not([type="submit"])'
-		];
-		
-		for (const sel of selectors) {
-			const input = document.querySelector(sel);
-			if (input && input.offsetParent !== null) {
-				input.click();
-				input.focus();
-				return { found: true, selector: sel, tagName: input.tagName };
-			}
-		}
-		
-		// 兜底：查找所有可见input
-		const inputs = document.querySelectorAll('input');
-		for (const input of inputs) {
-			if (input.offsetParent !== null && input.type !== 'hidden' && input.type !== 'submit') {
-				input.click();
-				input.focus();
-				return { found: true, selector: 'fallback', tagName: input.tagName };
-			}
-		}
-		
-		return { found: false, inputCount: inputs.length };
-	}`)
+	// 等待页面稳定
+	time.Sleep(1 * time.Second)
 
-	if inputResult != nil {
+	// 使用精确选择器查找 Google 邮箱输入框
+	var emailInput *rod.Element
+	selectors := []string{
+		"#email-input",            // Google Business 特定 ID
+		"input[name='loginHint']", // Google Business 特定 name
+		"input[jsname='YPqjbf']",  // Google jsname
+		"input[type='email']",
+		"input[type='text'][aria-label]",
+		"input:not([type='hidden']):not([type='submit']):not([type='checkbox'])",
 	}
 
-	time.Sleep(200 * time.Millisecond)
-
-	// 使用改进的输入方法
-	inputSuccess, _ := page.Eval(fmt.Sprintf(`() => {
-		const selectors = [
-			'input[type="email"]',
-			'input[name="identifier"]',
-			'input[autocomplete="email"]',
-			'input[autocomplete="username"]',
-			'input:not([type="hidden"]):not([type="submit"])'
-		];
-		
-		for (const sel of selectors) {
-			const input = document.querySelector(sel);
-			if (input && input.offsetParent !== null) {
-				input.focus();
-				input.value = %q;
-				input.dispatchEvent(new Event('input', { bubbles: true }));
-				input.dispatchEvent(new Event('change', { bubbles: true }));
-				return { success: true, value: input.value };
+	log.Printf("[注册 %d] 🔍 开始查找输入框...", threadID)
+	for _, sel := range selectors {
+		log.Printf("[注册 %d] 尝试选择器: %s", threadID, sel)
+		el, err := page.Timeout(3 * time.Second).Element(sel)
+		if err != nil {
+			log.Printf("[注册 %d] 选择器 %s 失败: %v", threadID, sel, err)
+			continue
+		}
+		if el != nil {
+			visible, _ := el.Visible()
+			log.Printf("[注册 %d] 选择器 %s 找到元素, visible=%v", threadID, sel, visible)
+			if visible {
+				emailInput = el
+				log.Printf("[注册 %d] ✅ 使用输入框: %s", threadID, sel)
+				break
 			}
 		}
-		return { success: false };
-	}`, email))
-
-	// 检查JS输入是否成功
-	jsSuccess := false
-	if inputSuccess != nil {
-		jsSuccess = inputSuccess.Value.Get("success").Bool()
-		inputValue := inputSuccess.Value.Get("value").Str()
-		log.Printf("[注册 %d] JS输入结果: success=%v, value=%s", threadID, jsSuccess, inputValue)
 	}
 
-	// 如果JS输入失败，使用键盘输入
-	if !jsSuccess {
-		log.Printf("[注册 %d] JS输入失败，尝试键盘输入...", threadID)
-		// 先清空输入框
-		page.Keyboard.Press(input.ControlLeft)
-		page.Keyboard.Type(input.KeyA)
-		page.Keyboard.Release(input.ControlLeft)
-		page.Keyboard.Press(input.Backspace)
+	if emailInput == nil {
+		// 打印页面 HTML 调试
+		html, _ := page.HTML()
+		if len(html) > 2000 {
+			html = html[:2000]
+		}
+		log.Printf("[注册 %d] ❌ 找不到邮箱输入框，页面HTML片段: %s", threadID, html)
+		result.Error = fmt.Errorf("找不到邮箱输入框")
+		return result
+	}
+
+	// 获取元素信息
+	tagName, _ := emailInput.Property("tagName")
+	inputType, _ := emailInput.Property("type")
+	inputId, _ := emailInput.Property("id")
+	inputName, _ := emailInput.Property("name")
+	log.Printf("[注册 %d] 📝 元素信息: tag=%s, type=%s, id=%s, name=%s",
+		threadID, tagName.String(), inputType.String(), inputId.String(), inputName.String())
+
+	// 滚动到元素并点击获取焦点
+	log.Printf("[注册 %d] 📍 滚动到元素...", threadID)
+	emailInput.MustScrollIntoView()
+	time.Sleep(100 * time.Millisecond)
+
+	// 使用 MustClick 确保点击成功
+	log.Printf("[注册 %d] 🖱️ 点击输入框...", threadID)
+	emailInput.MustClick()
+	time.Sleep(300 * time.Millisecond)
+
+	// 检查是否获得焦点
+	hasFocus, _ := page.Eval(`() => document.activeElement && document.activeElement.id`)
+	log.Printf("[注册 %d] 🎯 当前焦点元素ID: %v", threadID, hasFocus.Value)
+
+	// 清空输入框 - 使用 triple-click 全选然后删除
+	log.Printf("[注册 %d] 🗑️ 清空输入框...", threadID)
+	// 先检查当前是否有内容
+	currentVal, _ := emailInput.Property("value")
+	if currentVal.String() != "" {
+		emailInput.SelectAllText()
 		time.Sleep(100 * time.Millisecond)
-
-		// 逐字符输入
-		for _, char := range email {
-			page.Keyboard.Type(input.Key(char))
-			time.Sleep(20 * time.Millisecond)
-		}
-		log.Printf("[注册 %d] 键盘输入完成", threadID)
+		page.Keyboard.Type(input.Backspace)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	// 使用纯键盘逐字符输入
+	log.Printf("[注册 %d] ⌨️ 开始键盘输入邮箱: %s", threadID, email)
+	for i, char := range email {
+		err := page.Keyboard.Type(input.Key(char))
+		if err != nil {
+			log.Printf("[注册 %d] ❌ 字符 %d (%c) 输入失败: %v", threadID, i, char, err)
+		}
+		if i%10 == 0 {
+			// 每10个字符检查一次当前值
+			propVal, _ := emailInput.Property("value")
+			log.Printf("[注册 %d] 进度 %d/%d, 当前值: %s", threadID, i+1, len(email), propVal.String())
+		}
+		time.Sleep(time.Duration(50+rand.Intn(80)) * time.Millisecond)
+	}
+	log.Printf("[注册 %d] ⌨️ 键盘输入完成", threadID)
 
 	time.Sleep(500 * time.Millisecond)
-	debugScreenshot(page, threadID, "02_email_input")
+
+	// 验证输入
+	propVal, _ := emailInput.Property("value")
+	inputValue := propVal.String()
+	log.Printf("[注册 %d] 📋 最终输入值: [%s]", threadID, inputValue)
+
+	if inputValue != email {
+	} else {
+		log.Printf("[注册 %d] ✅ 输入验证成功", threadID)
+	}
 
 	// 触发 blur
 	page.Eval(`() => {
@@ -996,7 +1043,6 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	for i := 0; i < 8; i++ {
 		clickResult, _ := page.Eval(`() => {
 			if (!document.body) return { clicked: false, reason: 'body_null' };
-			
 			const targets = ['继续', 'Next', '邮箱', 'Continue'];
 			const elements = [
 				...document.querySelectorAll('button'),
@@ -1004,13 +1050,11 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 				...document.querySelectorAll('div[role="button"]'),
 				...document.querySelectorAll('span[role="button"]')
 			];
-
 			for (const element of elements) {
 				if (!element) continue;
 				const style = window.getComputedStyle(element);
 				if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
 				if (element.disabled) continue;
-
 				const text = element.textContent ? element.textContent.trim() : '';
 				if (targets.some(t => text.includes(t))) {
 					element.click();
@@ -1042,26 +1086,21 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			const pageText = document.body ? document.body.textContent : '';
 			const emailInput = document.querySelector('input[type="email"]');
 			const continueBtn = document.querySelector('button[jsname="LgbsSe"]');
-			
-			// 检查是否还在邮箱输入页面
 			const stillOnEmailPage = (emailInput && emailInput.offsetParent !== null) || 
 				(continueBtn && continueBtn.innerText && 
 				 (continueBtn.innerText.includes('继续') || continueBtn.innerText.includes('Continue')));
-			
-			// 检查是否跳转到验证码页面
 			const isVerifyPage = pageText.includes('验证') || pageText.includes('Verify') || 
 				pageText.includes('输入代码') || pageText.includes('Enter code') ||
 				pageText.includes('发送到') || pageText.includes('sent to');
-			
-			// 检查是否跳转到姓名页面
 			const isNamePage = pageText.includes('姓氏') || pageText.includes('名字') || 
 				pageText.includes('Full name') || pageText.includes('全名');
-			
-			// 检查错误
-			const hasError = pageText.includes('出了点问题') || pageText.includes('Something went wrong') ||
+			const errorElement = document.querySelector('.zyTWof-Ng57nc, .zyTWof-gIZMF, [role="alert"]');
+			const hasErrorElement = errorElement && errorElement.offsetParent !== null;
+			const hasError = hasErrorElement || 
+				pageText.includes('出了点问题') || pageText.includes('Something went wrong') ||
 				pageText.includes('无法创建') || pageText.includes('cannot create') ||
+				pageText.includes('try again later') || pageText.includes('稍后再试') ||
 				pageText.includes('电话') || pageText.includes('Phone');
-			
 			return {
 				stillOnEmailPage: stillOnEmailPage && !isVerifyPage && !isNamePage,
 				isVerifyPage: isVerifyPage,
@@ -1155,6 +1194,78 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		clickCount := 0
 
 		for time.Since(startTime) < maxWaitTime {
+			// 首先检查页面是否有错误（验证码发送失败等）
+			errorCheck, _ := page.Eval(`() => {
+				const pageText = document.body ? document.body.innerText : '';
+				
+				// 检查底部 toast/snackbar 错误提示
+				// "Something went wrong. Please try again later or choose another login method."
+				const toastSelectors = [
+					'[role="alert"]',
+					'.snackbar', '.toast', '.notification',
+					'aside', // Google 风格的错误提示
+					'[class*="error"]', '[class*="alert"]',
+					'[jscontroller="Q9PAie"]' // Google 特定的错误容器
+				];
+				let toastError = null;
+				for (const sel of toastSelectors) {
+					const el = document.querySelector(sel);
+					if (el && el.offsetParent !== null) {
+						const text = el.textContent || '';
+						if (text.includes('went wrong') || text.includes('try again') || 
+							text.includes('出了点问题') || text.includes('稍后再试') ||
+							text.includes('choose another') || text.includes('login method')) {
+							toastError = text;
+							break;
+						}
+					}
+				}
+				
+				// 检查各种错误情况
+				const errorIndicators = [
+					'出了点问题', 'Something went wrong', 'went wrong',
+					'稍后再试', 'try again later',
+					'无法发送', 'cannot send', 'failed to send',
+					'choose another login method', 'login method',
+					'too many', '请求过多'
+				];
+				const hasTextError = errorIndicators.some(ind => pageText.toLowerCase().includes(ind.toLowerCase()));
+				
+				// 检查是否有 Try again 按钮（表示错误状态）
+				const tryAgainBtn = document.querySelector('.mdc-button__label');
+				const hasTryAgain = tryAgainBtn && (tryAgainBtn.textContent.includes('Try again') || 
+					tryAgainBtn.textContent.includes('重试'));
+				
+				const hasError = toastError || hasTextError || hasTryAgain;
+				
+				return { 
+					hasError: hasError,
+					hasTryAgain: hasTryAgain,
+					toastError: toastError || '',
+					errorText: toastError || pageText.substring(0, 150)
+				};
+			}`)
+
+			if errorCheck != nil && errorCheck.Value.Get("hasError").Bool() {
+				// 如果有 Try again 按钮，点击它
+				if errorCheck.Value.Get("hasTryAgain").Bool() {
+					log.Printf("[注册 %d] 检测到错误页面，尝试点击 Try again", threadID)
+					page.Eval(`() => {
+						const label = document.querySelector('.mdc-button__label');
+						if (label) {
+							const btn = label.closest('button');
+							if (btn) btn.click();
+						}
+					}`)
+					time.Sleep(3 * time.Second)
+					continue
+				}
+				// 其他错误直接返回
+				result.Error = fmt.Errorf("验证码发送失败: %s", errorCheck.Value.Get("errorText").String()[:50])
+				log.Printf("[注册 %d] ❌ %v", threadID, result.Error)
+				return result
+			}
+
 			// 尝试点击重发按钮
 			clickResult, _ := page.Eval(`() => {
 				// 精确匹配: <span jsname="V67aGc" class="YuMlnb-vQzf8d">重新发送验证码</span>
@@ -1228,41 +1339,50 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 				inputInfo.Value.Get("count").Int(), isOTP)
 		}
 
-		if isOTP {
-			// OTP风格：先清空所有输入框，聚焦第一个，然后用键盘逐字符输入
-			page.Eval(`() => {
-				// 清空所有输入框
-				const inputs = document.querySelectorAll('input:not([type="hidden"])');
-				inputs.forEach(i => { i.value = ''; });
-				
-				// 尝试找到第一个OTP输入框并聚焦
-				const visibleInputs = Array.from(inputs).filter(i => i.offsetParent !== null);
-				if (visibleInputs.length > 0) {
-					visibleInputs[0].click();
-					visibleInputs[0].focus();
-				}
-			}`)
+		// 使用 rod Element API 查找验证码输入框
+		codeInputs, _ := page.Elements("input:not([type='hidden'])")
+		var firstCodeInput *rod.Element
+		for _, el := range codeInputs {
+			visible, _ := el.Visible()
+			if visible {
+				firstCodeInput = el
+				break
+			}
+		}
+
+		if firstCodeInput == nil {
+			log.Printf("[注册 %d] ⚠️ 未找到验证码输入框", threadID)
+		} else {
+			// 点击获取焦点
+			if err := firstCodeInput.Click(proto.InputMouseButtonLeft, 1); err != nil {
+				log.Printf("[注册 %d] 点击验证码输入框失败: %v", threadID, err)
+			}
 			time.Sleep(300 * time.Millisecond)
 
-			// 逐字符输入验证码（每个字符之间稍微延迟，让页面自动跳转到下一个框）
-			for i, char := range code {
-				page.Keyboard.Type(input.Key(char))
-				if i < len(code)-1 {
-					time.Sleep(150 * time.Millisecond) // 给页面时间跳转到下一个输入框
+			// 清空输入框
+			firstCodeInput.SelectAllText()
+			firstCodeInput.MustInput("")
+			time.Sleep(200 * time.Millisecond)
+
+			if isOTP {
+				// OTP风格：逐字符键盘输入，带延迟让页面自动跳转
+				for i, char := range code {
+					page.Keyboard.Type(input.Key(char))
+					if i < len(code)-1 {
+						time.Sleep(time.Duration(100+rand.Intn(100)) * time.Millisecond)
+					}
+				}
+			} else {
+				// 单个输入框：使用 rod Input
+				if err := firstCodeInput.Input(code); err != nil {
+					log.Printf("[注册 %d] 验证码 Input 失败: %v, 使用键盘输入", threadID, err)
+					for _, char := range code {
+						page.Keyboard.Type(input.Key(char))
+						time.Sleep(time.Duration(20+rand.Intn(30)) * time.Millisecond)
+					}
 				}
 			}
-		} else {
-			// 单个输入框：直接输入
-			page.Eval(`() => {
-				const inputs = document.querySelectorAll('input:not([type="hidden"])');
-				if (inputs.length > 0) {
-					inputs[0].value = '';
-					inputs[0].click();
-					inputs[0].focus();
-				}
-			}`)
-			time.Sleep(200 * time.Millisecond)
-			safeType(page, code, 15)
+			log.Printf("[注册 %d] 验证码输入完成", threadID)
 		}
 
 		time.Sleep(500 * time.Millisecond)
@@ -1307,40 +1427,59 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 	time.Sleep(500 * time.Millisecond)
 
-	// 查找姓名输入框
-	page.Eval(`() => {
-		const selectors = [
-			'input[name="fullName"]',
-			'input[autocomplete="name"]',
-			'input[type="text"]',
-			'input:not([type="hidden"]):not([type="submit"]):not([type="email"])'
-		];
-		for (const sel of selectors) {
-			const input = document.querySelector(sel);
-			if (input && input.offsetParent !== null) {
-				input.value = '';
-				input.click();
-				input.focus();
-				return true;
+	// 查找姓名输入框并使用 rod 原生方式输入
+	nameSelectors := []string{
+		`input[name="fullName"]`,
+		`input[autocomplete="name"]`,
+		`input[type="text"]:not([type="hidden"]):not([type="email"])`,
+	}
+
+	var nameInput *rod.Element
+	for _, sel := range nameSelectors {
+		nameInput, _ = page.Timeout(2 * time.Second).Element(sel)
+		if nameInput != nil {
+			visible, _ := nameInput.Visible()
+			if visible {
+				break
+			}
+			nameInput = nil
+		}
+	}
+
+	// 兜底：获取第一个可见的文本输入框
+	if nameInput == nil {
+		inputs, _ := page.Elements(`input:not([type="hidden"]):not([type="submit"]):not([type="email"])`)
+		for _, inp := range inputs {
+			if visible, _ := inp.Visible(); visible {
+				nameInput = inp
+				break
 			}
 		}
-		// 兜底
-		const inputs = document.querySelectorAll('input:not([type="hidden"])');
-		if (inputs.length > 0) {
-			inputs[0].value = '';
-			inputs[0].click();
-			inputs[0].focus();
-		}
-		return false;
-	}`)
-	time.Sleep(200 * time.Millisecond)
-
-	// 输入姓名 - 使用键盘输入
-	for _, char := range fullName {
-		page.Keyboard.Type(input.Key(char))
-		time.Sleep(30 * time.Millisecond)
 	}
-	log.Printf("[注册 %d] 姓名输入完成", threadID)
+
+	if nameInput != nil {
+		// 清空并聚焦
+		nameInput.Click(proto.InputMouseButtonLeft, 1)
+		time.Sleep(100 * time.Millisecond)
+		nameInput.SelectAllText()
+		time.Sleep(50 * time.Millisecond)
+		page.Keyboard.Type(input.Backspace)
+		time.Sleep(100 * time.Millisecond)
+
+		// 逐字符输入姓名
+		for _, char := range fullName {
+			page.Keyboard.Type(input.Key(char))
+			time.Sleep(30 * time.Millisecond)
+		}
+		log.Printf("[注册 %d] 姓名输入完成: %s", threadID, fullName)
+	} else {
+		log.Printf("[注册 %d] ⚠️ 未找到姓名输入框，尝试直接键盘输入", threadID)
+		// 直接键盘输入作为备用
+		for _, char := range fullName {
+			page.Keyboard.Type(input.Key(char))
+			time.Sleep(30 * time.Millisecond)
+		}
+	}
 	time.Sleep(500 * time.Millisecond)
 
 	// 确认提交姓名
@@ -1534,6 +1673,32 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 	log.Printf("[注册 %d] 获取到 %d 个 Cookie", threadID, len(resultCookies))
 
+	// 如果 csesidx 为空，尝试从 authorization 中提取
+	if csesidx == "" && authorization != "" {
+		csesidx = extractCSESIDXFromAuth(authorization)
+		if csesidx != "" {
+			log.Printf("[注册 %d] 从 authorization 提取 csesidx: %s", threadID, csesidx)
+		}
+	}
+
+	// 如果仍为空，尝试访问主页获取
+	if csesidx == "" {
+		log.Printf("[注册 %d] ⚠️ csesidx 为空，尝试访问主页获取...", threadID)
+		page.Navigate("https://business.gemini.google/")
+		time.Sleep(3 * time.Second)
+		info, _ := page.Info()
+		if info != nil {
+			if m := regexp.MustCompile(`[?&]csesidx=(\d+)`).FindStringSubmatch(info.URL); len(m) > 1 {
+				csesidx = m[1]
+				log.Printf("[注册 %d] 从主页URL提取 csesidx: %s", threadID, csesidx)
+			}
+		}
+	}
+
+	// 记录最终获取的值
+	log.Printf("[注册 %d] 📋 最终结果: configID=%s, csesidx=%s, auth长度=%d",
+		threadID, configID, csesidx, len(authorization))
+
 	result.Success = true
 	result.Authorization = authorization
 	result.Cookies = resultCookies
@@ -1618,7 +1783,12 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 		Set("disable-dev-shm-usage").
 		Set("disable-gpu").
 		Set("disable-blink-features", "AutomationControlled").
-		Set("window-size", "1280,800")
+		Set("window-size", "1280,800").
+		Set("disable-extensions").
+		Set("excludeSwitches", "enable-automation").
+		Set("disable-infobars").
+		Set("disable-automation").
+		Delete("enable-automation")
 
 	if proxy != "" {
 		l = l.Proxy(proxy)
@@ -1639,25 +1809,10 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 
 	browser = browser.Timeout(120 * time.Second)
 
-	pages, err := browser.Pages()
+	// 使用 stealth 创建页面
+	page, err := stealth.Page(browser)
 	if err != nil {
-		result.Error = fmt.Errorf("获取页面列表失败: %w", err)
-		return result
-	}
-
-	var page *rod.Page
-	if len(pages) > 0 {
-		page = pages[0]
-	} else {
-		page, err = browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
-		if err != nil {
-			result.Error = fmt.Errorf("创建新页面失败: %w", err)
-			return result
-		}
-	}
-
-	if page == nil {
-		result.Error = fmt.Errorf("无法获取或创建浏览器页面")
+		result.Error = fmt.Errorf("创建 stealth 页面失败: %w", err)
 		return result
 	}
 
@@ -1668,11 +1823,11 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 		log.Printf("[Cookie刷新] ⚠️ 设置视口失败: %v", err)
 	}
 
-	if err := page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
-		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	}); err != nil {
-		log.Printf("[Cookie刷新] ⚠️ 设置 User-Agent 失败: %v", err)
-	}
+	// 注入反检测脚本
+	page.Eval(`() => {
+		Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+		if (window.chrome) { window.chrome.runtime = undefined; }
+	}`)
 
 	var authorization string
 	var configID, csesidx string
@@ -1752,19 +1907,68 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 
 	// 检查是否在登录页面需要输入邮箱
 	if _, err := page.Timeout(5 * time.Second).Element("input"); err == nil {
+		log.Printf("[Cookie刷新] [%s] 🔍 查找邮箱输入框...", email)
 
-		// 输入邮箱 - 先清空再输入
-		time.Sleep(500 * time.Millisecond)
-		page.Eval(`() => {
-			const inputs = document.querySelectorAll('input');
-			if (inputs.length > 0) {
-				inputs[0].value = '';
-				inputs[0].click();
-				inputs[0].focus();
+		// 使用精确选择器查找输入框
+		var emailInput *rod.Element
+		selectors := []string{
+			"#email-input",
+			"input[name='loginHint']",
+			"input[jsname='YPqjbf']",
+			"input[type='email']",
+			"input[type='text'][aria-label]",
+			"input:not([type='hidden']):not([type='submit']):not([type='checkbox'])",
+		}
+		for _, sel := range selectors {
+			el, err := page.Timeout(2 * time.Second).Element(sel)
+			if err == nil && el != nil {
+				visible, _ := el.Visible()
+				if visible {
+					emailInput = el
+					log.Printf("[Cookie刷新] [%s] ✅ 找到输入框: %s", email, sel)
+					break
+				}
 			}
-		}`)
-		time.Sleep(300 * time.Millisecond)
-		safeType(page, email, 30)
+		}
+
+		if emailInput != nil {
+			// 点击获取焦点
+			emailInput.MustScrollIntoView()
+			emailInput.MustClick()
+			time.Sleep(300 * time.Millisecond)
+
+			// 清空输入框（仅当有内容时）
+			currentVal, _ := emailInput.Property("value")
+			if currentVal.String() != "" {
+				emailInput.SelectAllText()
+				time.Sleep(100 * time.Millisecond)
+				page.Keyboard.Type(input.Backspace)
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			log.Printf("[Cookie刷新] [%s] ⌨️ 开始键盘输入邮箱...", email)
+			for _, char := range email {
+				page.Keyboard.Type(input.Key(char))
+				time.Sleep(time.Duration(50+rand.Intn(80)) * time.Millisecond)
+			}
+
+			// 验证输入
+			propVal, _ := emailInput.Property("value")
+			log.Printf("[Cookie刷新] [%s] 📋 输入值: %s", email, propVal.String())
+		} else {
+			log.Printf("[Cookie刷新] [%s] ⚠️ 未找到输入框，尝试旧方式", email)
+			page.Eval(`() => {
+				const inputs = document.querySelectorAll('input');
+				if (inputs.length > 0) {
+					inputs[0].value = '';
+					inputs[0].click();
+					inputs[0].focus();
+				}
+			}`)
+			time.Sleep(300 * time.Millisecond)
+			safeType(page, email, 30)
+		}
+
 		time.Sleep(500 * time.Millisecond)
 		page.Eval(`() => {
 			const inputs = document.querySelectorAll('input');
@@ -1840,15 +2044,44 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 			continue // 重试
 		}
 
-		// 输入验证码
+		// 输入验证码 - OTP 风格使用键盘逐字符输入
+		log.Printf("[Cookie刷新] [%s] ⌨️ 开始输入验证码: %s", email, code)
 		time.Sleep(500 * time.Millisecond)
-		page.Eval(`() => {
-			const inputs = document.querySelectorAll('input');
-			for (const inp of inputs) { inp.value = ''; }
-			if (inputs.length > 0) { inputs[0].click(); inputs[0].focus(); }
-		}`)
-		time.Sleep(300 * time.Millisecond)
-		safeType(page, code, 30)
+
+		// 查找第一个可见输入框并点击获取焦点
+		codeInputs, _ := page.Elements("input:not([type='hidden'])")
+		var firstCodeInput *rod.Element
+		for _, el := range codeInputs {
+			visible, _ := el.Visible()
+			if visible {
+				firstCodeInput = el
+				break
+			}
+		}
+
+		if firstCodeInput != nil {
+			// 清空所有输入框
+			page.Eval(`() => {
+				const inputs = document.querySelectorAll('input');
+				for (const inp of inputs) { inp.value = ''; }
+			}`)
+			time.Sleep(200 * time.Millisecond)
+
+			// 点击第一个输入框获取焦点
+			firstCodeInput.MustClick()
+			time.Sleep(300 * time.Millisecond)
+
+			// 逐字符键盘输入（OTP 会自动跳转到下一个框）
+			for i, char := range code {
+				page.Keyboard.Type(input.Key(char))
+				if i < len(code)-1 {
+					time.Sleep(time.Duration(100+rand.Intn(100)) * time.Millisecond)
+				}
+			}
+			log.Printf("[Cookie刷新] [%s] ✅ 验证码输入完成", email)
+		} else {
+			log.Printf("[Cookie刷新] [%s] ⚠️ 未找到验证码输入框", email)
+		}
 		time.Sleep(500 * time.Millisecond)
 
 		// 点击验证按钮
@@ -1959,6 +2192,32 @@ extractResult:
 		}
 	}
 
+	// 如果 csesidx 为空，尝试从 authorization 中提取
+	if csesidx == "" && authorization != "" {
+		csesidx = extractCSESIDXFromAuth(authorization)
+		if csesidx != "" {
+			log.Printf("[Cookie刷新] [%s] 从 authorization 提取 csesidx: %s", email, csesidx)
+		}
+	}
+
+	// 如果仍为空，尝试访问主页获取
+	if csesidx == "" {
+		log.Printf("[Cookie刷新] [%s] ⚠️ csesidx 为空，尝试访问主页获取...", email)
+		page.Navigate("https://business.gemini.google/")
+		time.Sleep(3 * time.Second)
+		info, _ = page.Info()
+		if info != nil {
+			if m := regexp.MustCompile(`[?&]csesidx=(\d+)`).FindStringSubmatch(info.URL); len(m) > 1 {
+				csesidx = m[1]
+				log.Printf("[Cookie刷新] [%s] 从主页URL提取 csesidx: %s", email, csesidx)
+			}
+		}
+	}
+
+	// 记录最终获取的值
+	log.Printf("[Cookie刷新] [%s] 📋 最终结果: configID=%s, csesidx=%s, auth长度=%d",
+		email, configID, csesidx, len(authorization))
+
 	result.Success = true
 	result.Authorization = authorization
 	result.SecureCookies = resultCookies
@@ -1968,6 +2227,43 @@ extractResult:
 	log.Printf("[Cookie刷新] ✅ [%s] 刷新成功", email)
 	return result
 }
+
+// extractCSESIDXFromAuth 从 authorization header 中提取 csesidx
+func extractCSESIDXFromAuth(auth string) string {
+	parts := strings.Split(auth, " ")
+	if len(parts) != 2 {
+		return ""
+	}
+	jwtParts := strings.Split(parts[1], ".")
+	if len(jwtParts) != 3 {
+		return ""
+	}
+	// 解码 payload
+	payload := jwtParts[1]
+	// 补齐 padding
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		decoded, err = base64.RawURLEncoding.DecodeString(jwtParts[1])
+		if err != nil {
+			return ""
+		}
+	}
+	// 提取 sub 字段
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return ""
+	}
+	if sub, ok := claims["sub"].(string); ok && strings.HasPrefix(sub, "csesidx/") {
+		return strings.TrimPrefix(sub, "csesidx/")
+	}
+	return ""
+}
 func NativeRegisterWorker(id int, dataDirAbs string) {
 	time.Sleep(time.Duration(id) * 3 * time.Second)
 
@@ -1976,9 +2272,14 @@ func NativeRegisterWorker(id int, dataDirAbs string) {
 			return
 		}
 
-		logger.Debug("[注册线程 %d] 启动注册任务", id)
+		// 获取代理（优先使用代理池）
+		currentProxy := Proxy
+		if GetProxy != nil {
+			currentProxy = GetProxy()
+		}
+		logger.Debug("[注册线程 %d] 启动注册任务, 代理: %s", id, currentProxy)
 
-		result := RunBrowserRegister(Headless, Proxy, id)
+		result := RunBrowserRegister(Headless, currentProxy, id)
 
 		if result.Success {
 			if err := SaveBrowserRegisterResult(result, dataDirAbs); err != nil {
