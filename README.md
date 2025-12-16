@@ -57,7 +57,7 @@
 > 公益 Demo（免费调用）  
 > 🔗 链接：<https://business2api.openel.top>
 >
-> API Key 获取请访问 https://business2api.openel.top/atuh 获取个人专属免费APIKEY
+> API Key 获取请访问 https://business2api.openel.top/auth 获取个人专属免费APIKEY
 
 
 >> GLM 公益测试 API
