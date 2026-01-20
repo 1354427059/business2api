@@ -97,6 +97,115 @@ func generateRandomName() string {
 	return firstNames[rand.Intn(len(firstNames))] + " " + lastNames[rand.Intn(len(lastNames))]
 }
 
+// ==================== 拟人化操作工具函数 ====================
+
+// humanDelay 随机延迟（模拟人类反应时间）
+func humanDelay(minMs, maxMs int) {
+	if minMs >= maxMs {
+		maxMs = minMs + 1
+	}
+	delay := minMs + rand.Intn(maxMs-minMs)
+	time.Sleep(time.Duration(delay) * time.Millisecond)
+}
+
+// humanMouseMove 模拟人类鼠标移动到元素（贝塞尔曲线轨迹）
+func humanMouseMove(page *rod.Page, el *rod.Element) {
+	if page == nil || el == nil {
+		return
+	}
+	box, err := el.Shape()
+	if err != nil || box == nil || len(box.Quads) == 0 {
+		return
+	}
+	quad := box.Quads[0]
+	if len(quad) < 8 {
+		return
+	}
+	// 计算元素中心点（添加随机偏移）
+	centerX := (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+	centerY := (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+	offsetX := float64(rand.Intn(10) - 5)
+	offsetY := float64(rand.Intn(10) - 5)
+
+	// 模拟贝塞尔曲线移动（分多步）
+	steps := 5 + rand.Intn(5)
+	for i := 1; i <= steps; i++ {
+		progress := float64(i) / float64(steps)
+		// 使用 ease-out 曲线
+		eased := 1 - (1-progress)*(1-progress)
+		x := centerX*eased + offsetX
+		y := centerY*eased + offsetY
+		page.Mouse.MoveTo(proto.Point{X: x, Y: y})
+		time.Sleep(time.Duration(10+rand.Intn(20)) * time.Millisecond)
+	}
+}
+
+// humanClick 拟人化点击元素
+func humanClick(page *rod.Page, el *rod.Element) error {
+	if page == nil || el == nil {
+		return fmt.Errorf("page or element is nil")
+	}
+	// 1. 先移动鼠标到元素附近
+	humanMouseMove(page, el)
+	humanDelay(50, 150)
+
+	// 2. 点击前短暂停顿（模拟人类犹豫）
+	humanDelay(30, 100)
+
+	// 3. 执行点击
+	err := el.Click(proto.InputMouseButtonLeft, 1)
+
+	// 4. 点击后短暂停顿
+	humanDelay(80, 200)
+	return err
+}
+
+// humanType 拟人化打字（自然节奏，有随机停顿）
+func humanType(page *rod.Page, text string) {
+	if page == nil || text == "" {
+		return
+	}
+	for i, char := range text {
+		page.Keyboard.Type(input.Key(char))
+		// 基础延迟 + 随机变化
+		baseDelay := 50 + rand.Intn(80)
+		// 偶尔有较长停顿（模拟思考）
+		if rand.Float32() < 0.1 {
+			baseDelay += 150 + rand.Intn(200)
+		}
+		// 某些字符后停顿更长（如空格、标点）
+		if char == ' ' || char == '.' || char == '@' {
+			baseDelay += 30 + rand.Intn(50)
+		}
+		time.Sleep(time.Duration(baseDelay) * time.Millisecond)
+		// 每 8-12 个字符偶尔短暂休息
+		if i > 0 && i%(8+rand.Intn(5)) == 0 {
+			humanDelay(100, 300)
+		}
+	}
+}
+
+// humanScrollToElement 拟人化滚动到元素
+func humanScrollToElement(page *rod.Page, el *rod.Element) {
+	if el == nil {
+		return
+	}
+	humanDelay(100, 300)
+	el.ScrollIntoView()
+	humanDelay(200, 400)
+}
+
+// humanFocusInput 拟人化聚焦输入框
+func humanFocusInput(page *rod.Page, el *rod.Element) error {
+	if page == nil || el == nil {
+		return fmt.Errorf("page or element is nil")
+	}
+	// 滚动到元素
+	humanScrollToElement(page, el)
+	// 点击聚焦
+	return humanClick(page, el)
+}
+
 type TempMailProvider struct {
 	Name        string
 	GenerateURL string
@@ -738,7 +847,7 @@ func configureBrowserLauncher(l *launcher.Launcher, headless bool, proxy string)
 	// 窗口和显示参数
 	l = l.Set("window-size", "1920,1080").
 		Set("start-maximized").
-		Set("lang", "zh-CN,zh,en-US,en")
+		Set("lang", "en-US")
 
 	// 禁用可能暴露自动化的功能
 	l = l.Set("disable-extensions").
@@ -1414,12 +1523,14 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	inputName, _ := emailInput.Property("name")
 	log.Printf("[注册 %d] 📝 元素信息: tag=%s, type=%s, id=%s, name=%s",
 		threadID, tagName.String(), inputType.String(), inputId.String(), inputName.String())
-	log.Printf("[注册 %d] 📍 滚动到元素...", threadID)
-	emailInput.MustScrollIntoView()
-	time.Sleep(100 * time.Millisecond)
-	log.Printf("[注册 %d] 🖱️ 点击输入框...", threadID)
-	emailInput.MustClick()
-	time.Sleep(300 * time.Millisecond)
+	log.Printf("[注册 %d] 📍 拟人化聚焦输入框...", threadID)
+	if err := humanFocusInput(page, emailInput); err != nil {
+		log.Printf("[注册 %d] ⚠️ 聚焦失败，回退到直接点击: %v", threadID, err)
+		emailInput.MustScrollIntoView()
+		humanDelay(100, 300)
+		emailInput.MustClick()
+	}
+	humanDelay(200, 400)
 	hasFocus, _ := page.Eval(`() => document.activeElement && document.activeElement.id`)
 	log.Printf("[注册 %d] 🎯 当前焦点元素ID: %v", threadID, hasFocus.Value)
 
@@ -1429,26 +1540,15 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	currentVal, _ := emailInput.Property("value")
 	if currentVal.String() != "" {
 		emailInput.SelectAllText()
-		time.Sleep(100 * time.Millisecond)
+		humanDelay(80, 150)
 		page.Keyboard.Type(input.Backspace)
-		time.Sleep(100 * time.Millisecond)
+		humanDelay(80, 150)
 	}
 
-	// 使用纯键盘逐字符输入
-	log.Printf("[注册 %d] ⌨️ 开始键盘输入邮箱: %s", threadID, email)
-	for i, char := range email {
-		err := page.Keyboard.Type(input.Key(char))
-		if err != nil {
-			log.Printf("[注册 %d] ❌ 字符 %d (%c) 输入失败: %v", threadID, i, char, err)
-		}
-		if i%10 == 0 {
-			// 每10个字符检查一次当前值
-			propVal, _ := emailInput.Property("value")
-			log.Printf("[注册 %d] 进度 %d/%d, 当前值: %s", threadID, i+1, len(email), propVal.String())
-		}
-		time.Sleep(time.Duration(50+rand.Intn(80)) * time.Millisecond)
-	}
-	log.Printf("[注册 %d] ⌨️ 键盘输入完成", threadID)
+	// 使用拟人化打字输入邮箱
+	log.Printf("[注册 %d] ⌨️ 开始拟人化输入邮箱: %s", threadID, email)
+	humanType(page, email)
+	log.Printf("[注册 %d] ⌨️ 邮箱输入完成", threadID)
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -1473,45 +1573,70 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	debugScreenshot(page, threadID, "03_before_submit")
 	emailSubmitted := false
 	for i := 0; i < 8; i++ {
-		clickResult, _ := page.Eval(`() => {
-			if (!document.body) return { clicked: false, reason: 'body_null' };
-			const targets = ['继续', 'Next', '邮箱', 'Continue'];
-			const elements = [
-				...document.querySelectorAll('button'),
-				...document.querySelectorAll('input[type="submit"]'),
-				...document.querySelectorAll('div[role="button"]'),
-				...document.querySelectorAll('span[role="button"]')
-			];
-			for (const element of elements) {
-				if (!element) continue;
-				const style = window.getComputedStyle(element);
-				if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-				if (element.disabled) continue;
-				const text = element.textContent ? element.textContent.trim() : '';
-				if (targets.some(t => text.includes(t))) {
-					element.click();
-					return { clicked: true, text: text };
+		// 拟人化延迟（模拟人类寻找按钮的时间）
+		humanDelay(200, 500)
+
+		// 使用 rod 原生方式查找并点击按钮（避免 JS click() 被检测）
+		buttonSelectors := []string{
+			`button`,
+			`input[type="submit"]`,
+			`div[role="button"]`,
+			`span[role="button"]`,
+		}
+		targetTexts := []string{"继续", "Next", "邮箱", "Continue"}
+
+		var targetButton *rod.Element
+		for _, sel := range buttonSelectors {
+			elements, err := page.Elements(sel)
+			if err != nil {
+				continue
+			}
+			for _, el := range elements {
+				visible, _ := el.Visible()
+				if !visible {
+					continue
+				}
+				text, _ := el.Text()
+				text = strings.TrimSpace(text)
+				for _, target := range targetTexts {
+					if strings.Contains(text, target) {
+						targetButton = el
+						break
+					}
+				}
+				if targetButton != nil {
+					break
 				}
 			}
-			return { clicked: false, reason: 'no_button' };
-		}`)
+			if targetButton != nil {
+				break
+			}
+		}
 
-		if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+		if targetButton != nil {
+			log.Printf("[注册 %d] 找到提交按钮，执行拟人化点击", threadID)
+			if err := humanClick(page, targetButton); err != nil {
+				log.Printf("[注册 %d] ⚠️ humanClick 失败: %v，回退到直接点击", threadID, err)
+				targetButton.MustClick()
+			}
+			humanDelay(300, 600)
 			emailSubmitted = true
 			break
 		}
+
 		log.Printf("[注册 %d] 尝试 %d/8: 未找到按钮", threadID, i+1)
-		time.Sleep(1 * time.Second)
+		humanDelay(800, 1200)
 	}
 	if !emailSubmitted {
 		result.Error = fmt.Errorf("找不到提交按钮")
 		return result
 	}
+
 	// 等待页面跳转，最多等待15秒
 	var needsVerification bool
 	var pageTransitioned bool
 	for waitCount := 0; waitCount < 12; waitCount++ { // 优化：减少最大等待次数
-		time.Sleep(800 * time.Millisecond) // 优化：减少每次等待
+		humanDelay(600, 1000)
 
 		// 检查页面是否已经离开邮箱输入页面
 		transitionResult, _ := page.Eval(`() => {
@@ -1617,6 +1742,136 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		log.Printf("[注册 %d] 页面状态: needsVerification=%v, isNamePage=%v", threadID, needsVerification, isNamePage)
 	} else {
 		needsVerification = true
+	}
+
+	// 检测并处理 signin-error 页面（被检测到后的恢复）
+	info, _ := page.Info()
+	if info != nil && strings.Contains(info.URL, "signin-error") {
+		log.Printf("[注册 %d] ⚠️ 检测到 signin-error 页面，等待页面就绪...", threadID)
+
+		// 等待页面完全加载
+		page.WaitLoad()
+		humanDelay(1500, 2500)
+
+		log.Printf("[注册 %d] 开始尝试恢复...", threadID)
+
+		// 查找 "Sign up or sign in" 按钮（带重试）
+		var signupButton *rod.Element
+		var findErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			signupButton, findErr = func() (*rod.Element, error) {
+				buttonSelectors := []string{"button", `div[role="button"]`, `span[role="button"]`}
+				targetTexts := []string{"Sign up", "sign in", "Sign in", "注册", "登录"}
+
+				for _, sel := range buttonSelectors {
+					elements, err := page.Elements(sel)
+					if err != nil {
+						continue
+					}
+					for _, el := range elements {
+						visible, _ := el.Visible()
+						if !visible {
+							continue
+						}
+						text, _ := el.Text()
+						for _, target := range targetTexts {
+							if strings.Contains(text, target) {
+								return el, nil
+							}
+						}
+					}
+				}
+				return nil, fmt.Errorf("未找到 Sign up or sign in 按钮")
+			}()
+
+			if signupButton != nil {
+				break
+			}
+			log.Printf("[注册 %d] 尝试 %d/3: %v，等待后重试...", threadID, attempt+1, findErr)
+			humanDelay(1000, 1500)
+		}
+
+		if signupButton == nil {
+			log.Printf("[注册 %d] ❌ %v，放弃恢复", threadID, findErr)
+			result.Error = fmt.Errorf("被检测并重定向到 signin-error，恢复失败")
+			return result
+		}
+
+		log.Printf("[注册 %d] 找到恢复按钮，执行拟人化点击", threadID)
+		humanClick(page, signupButton)
+		humanDelay(1500, 2500)
+
+		// 等待页面加载，重新查找邮箱输入框
+		page.WaitLoad()
+		humanDelay(500, 1000)
+
+		// 重新输入邮箱
+		var retryEmailInput *rod.Element
+		retryEmailSelectors := []string{
+			"#email-input",
+			"input[name='loginHint']",
+			"input[type='email']",
+			"input[type='text'][aria-label]",
+		}
+		for _, sel := range retryEmailSelectors {
+			el, err := page.Timeout(3 * time.Second).Element(sel)
+			if err == nil && el != nil {
+				if visible, _ := el.Visible(); visible {
+					retryEmailInput = el
+					break
+				}
+			}
+		}
+
+		if retryEmailInput != nil {
+			log.Printf("[注册 %d] 重新输入邮箱: %s", threadID, email)
+			humanFocusInput(page, retryEmailInput)
+			humanDelay(200, 400)
+			retryEmailInput.SelectAllText()
+			humanDelay(50, 100)
+			page.Keyboard.Type(input.Backspace)
+			humanDelay(80, 150)
+			humanType(page, email)
+			humanDelay(400, 700)
+
+			// 重新点击提交按钮
+			retryButtonSelectors := []string{"button", `input[type="submit"]`, `div[role="button"]`}
+			retryTargetTexts := []string{"继续", "Next", "Continue"}
+			var retrySubmitBtn *rod.Element
+			for _, sel := range retryButtonSelectors {
+				elements, _ := page.Elements(sel)
+				for _, el := range elements {
+					if visible, _ := el.Visible(); !visible {
+						continue
+					}
+					text, _ := el.Text()
+					for _, target := range retryTargetTexts {
+						if strings.Contains(text, target) {
+							retrySubmitBtn = el
+							break
+						}
+					}
+					if retrySubmitBtn != nil {
+						break
+					}
+				}
+				if retrySubmitBtn != nil {
+					break
+				}
+			}
+
+			if retrySubmitBtn != nil {
+				log.Printf("[注册 %d] 重新提交邮箱", threadID)
+				humanClick(page, retrySubmitBtn)
+				humanDelay(2000, 3000)
+
+				// 重新检查页面状态
+				page.WaitLoad()
+				humanDelay(1000, 1500)
+			}
+		} else {
+			log.Printf("[注册 %d] ⚠️ 恢复后未找到邮箱输入框", threadID)
+		}
 	}
 
 	// 处理验证码
@@ -1833,15 +2088,16 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		if firstCodeInput == nil {
 			log.Printf("[注册 %d] ⚠️ 未找到验证码输入框", threadID)
 		} else {
+			// 使用拟人化点击验证码框
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						log.Printf("[注册 %d] 点击验证码框异常: %v", threadID, r)
 					}
 				}()
-				firstCodeInput.Click(proto.InputMouseButtonLeft, 1)
+				humanClick(page, firstCodeInput)
 			}()
-			time.Sleep(300 * time.Millisecond)
+			humanDelay(200, 400)
 
 			// 清空输入框（带超时保护）
 			func() {
@@ -1853,19 +2109,15 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 				firstCodeInput.SelectAllText()
 				firstCodeInput.Input("")
 			}()
-			time.Sleep(200 * time.Millisecond)
+			humanDelay(150, 300)
 
-			// 直接使用键盘输入（更可靠）
-			for i, char := range code {
-				page.Keyboard.Type(input.Key(char))
-				if i < len(code)-1 {
-					time.Sleep(time.Duration(80+rand.Intn(80)) * time.Millisecond)
-				}
-			}
+			// 使用拟人化打字输入验证码
+			log.Printf("[注册 %d] ⌨️ 开始拟人化输入验证码...", threadID)
+			humanType(page, code)
 			log.Printf("[注册 %d] 验证码输入完成", threadID)
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		humanDelay(400, 700)
 
 		for i := 0; i < 5; i++ {
 			clickResult, _ := page.Eval(`() => {
@@ -1892,12 +2144,13 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			}`)
 
 			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+				humanDelay(300, 600)
 				break
 			}
-			time.Sleep(1 * time.Second)
+			humanDelay(800, 1200)
 		}
 
-		time.Sleep(2 * time.Second)
+		humanDelay(1500, 2500)
 	}
 
 	// 填写姓名
@@ -1905,7 +2158,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	result.FullName = fullName
 	log.Printf("[注册 %d] 准备输入姓名: %s", threadID, fullName)
 
-	time.Sleep(500 * time.Millisecond)
+	humanDelay(400, 700)
 
 	// 查找姓名输入框并使用 rod 原生方式输入
 	nameSelectors := []string{
@@ -1938,29 +2191,25 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}
 
 	if nameInput != nil {
-		// 清空并聚焦
-		nameInput.Click(proto.InputMouseButtonLeft, 1)
-		time.Sleep(100 * time.Millisecond)
+		// 拟人化聚焦并清空
+		log.Printf("[注册 %d] 📍 拟人化聚焦姓名输入框...", threadID)
+		humanClick(page, nameInput)
+		humanDelay(100, 200)
 		nameInput.SelectAllText()
-		time.Sleep(50 * time.Millisecond)
+		humanDelay(50, 100)
 		page.Keyboard.Type(input.Backspace)
-		time.Sleep(100 * time.Millisecond)
+		humanDelay(80, 150)
 
-		// 逐字符输入姓名
-		for _, char := range fullName {
-			page.Keyboard.Type(input.Key(char))
-			time.Sleep(30 * time.Millisecond)
-		}
+		// 拟人化输入姓名
+		log.Printf("[注册 %d] ⌨️ 开始拟人化输入姓名: %s", threadID, fullName)
+		humanType(page, fullName)
 		log.Printf("[注册 %d] 姓名输入完成: %s", threadID, fullName)
 	} else {
 		log.Printf("[注册 %d] ⚠️ 未找到姓名输入框，尝试直接键盘输入", threadID)
-		// 直接键盘输入作为备用
-		for _, char := range fullName {
-			page.Keyboard.Type(input.Key(char))
-			time.Sleep(30 * time.Millisecond)
-		}
+		// 使用拟人化打字作为备用
+		humanType(page, fullName)
 	}
-	time.Sleep(500 * time.Millisecond)
+	humanDelay(400, 700)
 
 	// 确认提交姓名
 	confirmSubmitted := false

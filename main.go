@@ -487,13 +487,13 @@ var appConfig = AppConfig{
 		MinCount:               10,
 		CheckIntervalMinutes:   30,
 		RegisterThreads:        1,
-		RegisterHeadless:       true,
+		RegisterHeadless:       false,
 		RefreshOnStartup:       true,
 		RefreshCooldownSec:     240, // 4分钟
 		UseCooldownSec:         15,  // 15秒
 		MaxFailCount:           3,
 		EnableBrowserRefresh:   true, // 默认启用浏览器刷新
-		BrowserRefreshHeadless: true,
+		BrowserRefreshHeadless: false,
 		BrowserRefreshMaxRetry: 1, // 浏览器刷新最多重试1次
 	},
 }
