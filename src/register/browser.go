@@ -1635,8 +1635,18 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	// 等待页面跳转，最多等待15秒
 	var needsVerification bool
 	var pageTransitioned bool
+	var detectedSigninError bool
 	for waitCount := 0; waitCount < 12; waitCount++ { // 优化：减少最大等待次数
 		humanDelay(600, 1000)
+
+		// 检查是否被重定向到 signin-error 页面（提前检测）
+		pageInfo, _ := page.Info()
+		if pageInfo != nil && strings.Contains(pageInfo.URL, "signin-error") {
+			log.Printf("[注册 %d] ⚠️ 在等待过程中检测到 signin-error 页面", threadID)
+			detectedSigninError = true
+			pageTransitioned = true
+			break
+		}
 
 		// 检查页面是否已经离开邮箱输入页面
 		transitionResult, _ := page.Eval(`() => {
@@ -1657,7 +1667,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			const hasError = hasErrorElement || 
 				pageText.includes('出了点问题') || pageText.includes('Something went wrong') ||
 				pageText.includes('无法创建') || pageText.includes('cannot create') ||
-				pageText.includes('try again later') || pageText.includes('稍后再试') ||
+				pageText.includes('try again later') || pageText.includes('稀后再试') ||
 				pageText.includes('需要电话') || pageText.includes('电话号码') || 
 				pageText.includes('Phone number') || pageText.includes('Verify your phone');
 			return {
@@ -1687,6 +1697,14 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 		if waitCount%3 == 2 {
 			log.Printf("[注册 %d] 等待页面跳转... (%d/15秒)", threadID, waitCount+1)
+		}
+	}
+
+	// 跳转后再次检查 signin-error（以防在 break 后才跳转）
+	if !detectedSigninError {
+		pageInfo, _ := page.Info()
+		if pageInfo != nil && strings.Contains(pageInfo.URL, "signin-error") {
+			detectedSigninError = true
 		}
 	}
 
@@ -1745,13 +1763,12 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}
 
 	// 检测并处理 signin-error 页面（被检测到后的恢复）
-	info, _ := page.Info()
-	if info != nil && strings.Contains(info.URL, "signin-error") {
-		log.Printf("[注册 %d] ⚠️ 检测到 signin-error 页面，等待页面就绪...", threadID)
+	if detectedSigninError {
+		log.Printf("[注册 %d] ⚠️ 开始处理 signin-error 页面恢复...", threadID)
 
 		// 等待页面完全加载
 		page.WaitLoad()
-		humanDelay(1500, 2500)
+		humanDelay(500, 800)
 
 		log.Printf("[注册 %d] 开始尝试恢复...", threadID)
 
@@ -1788,7 +1805,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 				break
 			}
 			log.Printf("[注册 %d] 尝试 %d/3: %v，等待后重试...", threadID, attempt+1, findErr)
-			humanDelay(1000, 1500)
+			humanDelay(400, 600)
 		}
 
 		if signupButton == nil {
@@ -1799,11 +1816,11 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 		log.Printf("[注册 %d] 找到恢复按钮，执行拟人化点击", threadID)
 		humanClick(page, signupButton)
-		humanDelay(1500, 2500)
+		humanDelay(500, 800)
 
 		// 等待页面加载，重新查找邮箱输入框
 		page.WaitLoad()
-		humanDelay(500, 1000)
+		humanDelay(300, 500)
 
 		// 重新输入邮箱
 		var retryEmailInput *rod.Element
@@ -1863,11 +1880,11 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			if retrySubmitBtn != nil {
 				log.Printf("[注册 %d] 重新提交邮箱", threadID)
 				humanClick(page, retrySubmitBtn)
-				humanDelay(2000, 3000)
+				humanDelay(800, 1200)
 
 				// 重新检查页面状态
 				page.WaitLoad()
-				humanDelay(1000, 1500)
+				humanDelay(500, 800)
 			}
 		} else {
 			log.Printf("[注册 %d] ⚠️ 恢复后未找到邮箱输入框", threadID)
