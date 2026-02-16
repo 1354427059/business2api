@@ -1,23 +1,25 @@
-version: '3.8'
+version: "3.8"
 
 services:
   business2api:
-    image: ghcr.io/xxxxteam/business2api:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: business2api:local
     container_name: business2api
     restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
-      - ./config.json:/app/config/config.json:ro
+      - ../data:/app/data
+      - ../config/config.json:/app/config/config.json:ro
     environment:
       - TZ=Asia/Shanghai
       - LISTEN_ADDR=:8000
       - DATA_DIR=/app/data
-      # - PROXY=http://proxy:port
       # - API_KEY=your-api-key
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/v1/models"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -26,3 +28,43 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  registrar:
+    build:
+      context: ..
+      dockerfile: python/registrar/Dockerfile
+    image: business2api-registrar:local
+    container_name: business2api-registrar
+    restart: unless-stopped
+    depends_on:
+      - business2api
+      - selenium
+    ports:
+      - "8090:8090"
+    environment:
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8090
+      - LOG_LEVEL=INFO
+      - B2A_BASE_URL=http://business2api:8000
+      - B2A_API_KEY=sk-local-test-key-123456
+      - MAIL_API=https://mail.chatgpt.org.uk
+      - MAIL_KEY=gpt-test
+      - SELENIUM_REMOTE_URL=http://selenium:4444/wd/hub
+      - HEADLESS=${REGISTRAR_HEADLESS:-false}
+      - ENABLE_AUTO_REGISTER=true
+      - ENABLE_AUTO_REFRESH=true
+      - REGISTER_MAX_WORKERS=1
+      - REFRESH_BATCH_LIMIT=20
+      - REGISTER_INTERVAL_SEC=30
+      - REFRESH_INTERVAL_SEC=20
+      - ARTIFACTS_DIR=/tmp/registrar-artifacts
+    volumes:
+      - ../data/registrar-artifacts:/tmp/registrar-artifacts
+
+  selenium:
+    image: ${SELENIUM_IMAGE:-selenium/standalone-chrome:latest}
+    container_name: business2api-selenium
+    restart: unless-stopped
+    shm_size: 2gb
+    ports:
+      - "4444:4444"

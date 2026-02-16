@@ -15,13 +15,16 @@ import (
 // ==================== 注册与刷新 ====================
 
 var (
-	DataDir       string
-	TargetCount   int
-	MinCount      int
-	CheckInterval time.Duration
-	Threads       int
-	Headless      bool   // 注册无头模式
-	Proxy         string // 代理
+	DataDir          string
+	TargetCount      int
+	MinCount         int
+	CheckInterval    time.Duration
+	Threads          int
+	Headless         bool                  // 注册无头模式
+	Proxy            string                // 代理
+	EnableGoRegister = true                // 是否启用 Go 内置注册
+	MailChannelOrder = []string{"chatgpt"} // 邮箱渠道优先级
+	DuckMailBearer   string                // DuckMail Bearer
 )
 
 var IsRegistering int32
@@ -78,6 +81,10 @@ type RegisterResult struct {
 
 // StartRegister 启动注册任务（优化并发控制）
 func StartRegister(count int) error {
+	if !EnableGoRegister {
+		return fmt.Errorf("Go 注册已禁用，请使用外部 registrar")
+	}
+
 	registerMu.Lock()
 	defer registerMu.Unlock()
 
@@ -167,6 +174,11 @@ func PoolMaintainer() {
 
 // CheckAndMaintainPool 检查并维护号池（优化并发控制）
 func CheckAndMaintainPool() {
+	if !EnableGoRegister {
+		logger.Debug("⏸️ Go 注册已禁用，跳过号池自动补号")
+		return
+	}
+
 	// 如果正在注册中，跳过检查
 	if atomic.LoadInt32(&IsRegistering) == 1 {
 		logger.Debug("⏳ 注册进程运行中，跳过本次检查")

@@ -196,8 +196,11 @@ sudo systemctl start business2api
     "target_count": 50,                // 目标账号数量
     "min_count": 10,                   // 最小账号数，低于此值触发注册
     "check_interval_minutes": 30,      // 检查间隔（分钟）
+    "enable_go_register": true,        // 是否启用 Go 内置注册
     "register_threads": 1,             // 本地注册线程数
     "register_headless": true,         // 无头模式注册
+    "mail_channel_order": ["chatgpt"], // 邮箱渠道优先级（可选: duckmail, chatgpt）
+    "duckmail_bearer": "",             // DuckMail Bearer（启用 duckmail 时必填）
     "refresh_on_startup": true,        // 启动时刷新账号
     "refresh_cooldown_sec": 240,       // 刷新冷却时间（秒）
     "use_cooldown_sec": 15,            // 使用冷却时间（秒）
@@ -205,7 +208,8 @@ sudo systemctl start business2api
     "enable_browser_refresh": true,    // 启用浏览器刷新401账号
     "browser_refresh_headless": true,  // 浏览器刷新无头模式
     "browser_refresh_max_retry": 1,    // 浏览器刷新最大重试次数
-    "auto_delete_401": false           // 401时自动删除账号
+    "auto_delete_401": false,          // 401时自动删除账号
+    "external_refresh_mode": false     // 启用外部续期模式（Python registrar）
   },
 
   "pool_server": {                     
@@ -257,6 +261,8 @@ sudo systemctl start business2api
 | `pool.use_cooldown_sec` | 使用冷却时间 |
 | `pool.max_fail_count` | 最大失败次数 |
 | `pool.enable_browser_refresh` | 浏览器刷新开关 | 
+| `pool.enable_go_register` | Go 注册开关 |
+| `pool.external_refresh_mode` | 外部续期开关 |
 
 **配置合并机制：** 配置文件中缺失的字段会自动使用默认值，无需手动同步示例文件。
 

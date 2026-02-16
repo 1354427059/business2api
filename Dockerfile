@@ -37,6 +37,9 @@ RUN apk add --no-cache \
 # Copy binary from builder
 COPY --from=builder /app/business2api .
 
+# Copy admin panel static assets
+COPY web/ ./web/
+
 # Copy config template if exists
 COPY config.json.exampl[e] ./
 

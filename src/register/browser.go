@@ -1,6 +1,7 @@
 package register
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -67,8 +68,9 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 }
 
 type TempEmailResponse struct {
-	Email string `json:"email"`
-	Data  struct {
+	Success bool   `json:"success"`
+	Email   string `json:"email"`
+	Data    struct {
 		Email string `json:"email"`
 	} `json:"data"`
 }
@@ -79,18 +81,43 @@ type EmailListResponse struct {
 	} `json:"data"`
 }
 type EmailContent struct {
-	Subject string `json:"subject"`
-	Content string `json:"content"`
+	ID          string `json:"id"`
+	Subject     string `json:"subject"`
+	Content     string `json:"content"`
+	HTMLContent string `json:"html_content"`
+	TextContent string `json:"text_content"`
 }
 type BrowserRegisterResult struct {
 	Success       bool
 	Email         string
 	FullName      string
+	MailProvider  string
+	MailPassword  string
 	Authorization string
 	Cookies       []pool.Cookie
 	ConfigID      string
 	CSESIDX       string
 	Error         error
+}
+
+const (
+	MailProviderChatGPT  = "chatgpt"
+	MailProviderDuckMail = "duckmail"
+	duckMailAPIBase      = "https://api.duckmail.sbs"
+	scriptMailAPI        = "https://mail.chatgpt.org.uk"
+	scriptMailKey        = "gpt-test"
+	scriptLoginURL       = "https://auth.business.gemini.google/login?continueUrl=https:%2F%2Fbusiness.gemini.google%2F&wiffid=CAoSJDIwNTlhYzBjLTVlMmMtNGUxZC1hY2JkLThmOGY2ZDE0ODM1Mg"
+
+	// reg_gemini.py 中的关键 XPath
+	scriptEmailInputXPath  = "/html/body/c-wiz/div/div/div[1]/div/div/div/form/div[1]/div[1]/div/span[2]/input"
+	scriptContinueBtnXPath = "/html/body/c-wiz/div/div/div[1]/div/div/div/form/div[2]/div/button"
+	scriptVerifyBtnXPath   = "/html/body/c-wiz/div/div/div[1]/div/div/div/form/div[2]/div/div[1]/span/div[1]/button"
+)
+
+type InboxSession struct {
+	Provider string
+	Email    string
+	Password string
 }
 
 func generateRandomName() string {
@@ -206,6 +233,37 @@ func humanFocusInput(page *rod.Page, el *rod.Element) error {
 	return humanClick(page, el)
 }
 
+func findVisibleElementByXPath(page *rod.Page, xpath string, timeout time.Duration) (*rod.Element, bool) {
+	if page == nil || strings.TrimSpace(xpath) == "" {
+		return nil, false
+	}
+	el, err := page.Timeout(timeout).ElementX(xpath)
+	if err != nil || el == nil {
+		return nil, false
+	}
+	visible, _ := el.Visible()
+	if !visible {
+		return nil, false
+	}
+	return el, true
+}
+
+func clickByXPathJS(page *rod.Page, xpath string) bool {
+	if page == nil || strings.TrimSpace(xpath) == "" {
+		return false
+	}
+	clickResult, err := page.Eval(fmt.Sprintf(`() => {
+		const target = document.evaluate(%q, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+		if (!target) return false;
+		target.click();
+		return true;
+	}`, xpath))
+	if err != nil || clickResult == nil {
+		return false
+	}
+	return clickResult.Value.Bool()
+}
+
 type TempMailProvider struct {
 	Name        string
 	GenerateURL string
@@ -217,14 +275,292 @@ type TempMailProvider struct {
 var tempMailProviders = []TempMailProvider{
 	{
 		Name:        "chatgpt.org.uk",
-		GenerateURL: "https://mail.chatgpt.org.uk/api/generate-email",
-		CheckURL:    "https://mail.chatgpt.org.uk/api/emails?email=%s",
+		GenerateURL: scriptMailAPI + "/api/generate-email",
+		CheckURL:    scriptMailAPI + "/api/emails?email=%s",
 		Headers: map[string]string{
 			"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-			"Referer":    "https://mail.chatgpt.org.uk",
+			"Referer":    scriptMailAPI,
+			"X-API-Key":  scriptMailKey,
 		},
 	},
 	// 备用邮箱服务可以在这里添加
+}
+
+func normalizeMailChannels(channels []string) []string {
+	if len(channels) == 0 {
+		return []string{MailProviderChatGPT}
+	}
+	seen := make(map[string]bool)
+	var result []string
+	for _, ch := range channels {
+		provider := strings.ToLower(strings.TrimSpace(ch))
+		if provider != MailProviderChatGPT && provider != MailProviderDuckMail {
+			continue
+		}
+		if seen[provider] {
+			continue
+		}
+		seen[provider] = true
+		result = append(result, provider)
+	}
+	if len(result) == 0 {
+		return []string{MailProviderChatGPT}
+	}
+	return result
+}
+
+func getMailChannelOrder() []string {
+	return normalizeMailChannels(MailChannelOrder)
+}
+
+func createInboxWithFallback() (*InboxSession, error) {
+	// 注册流程固定使用 chatgpt 邮箱，不走 duckmail
+	email, err := getTemporaryEmail()
+	if err != nil {
+		return nil, fmt.Errorf("chatgpt 邮箱创建失败: %w", err)
+	}
+	log.Printf("✅ [邮箱渠道 provider=%s] 创建邮箱成功: %s", MailProviderChatGPT, email)
+	return &InboxSession{
+		Provider: MailProviderChatGPT,
+		Email:    email,
+	}, nil
+}
+
+func generateDuckMailPrefix() string {
+	chars := "abcdefghijklmnopqrstuvwxyz0123456789"
+	length := 8 + rand.Intn(6)
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(b)
+}
+
+func generateDuckMailPassword() string {
+	chars := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	length := 12
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(b)
+}
+
+func doJSONRequest(method, url string, headers map[string]string, payload interface{}, timeout time.Duration) (int, []byte, error) {
+	var bodyReader *bytes.Reader
+	if payload != nil {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return 0, nil, fmt.Errorf("序列化请求体失败: %w", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	} else {
+		bodyReader = bytes.NewReader(nil)
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return 0, nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Business2API/1.0)")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	if httpClient != nil {
+		client = httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("请求失败: %w", err)
+	}
+	respBody, readErr := readResponseBody(resp)
+	if readErr != nil {
+		return resp.StatusCode, nil, fmt.Errorf("读取响应失败: %w", readErr)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+func createDuckMailInbox() (*InboxSession, error) {
+	bearer := strings.TrimSpace(DuckMailBearer)
+	if bearer == "" {
+		return nil, fmt.Errorf("duckmail_bearer 未配置")
+	}
+
+	headers := map[string]string{
+		"Authorization": "Bearer " + bearer,
+	}
+	registerURL := duckMailAPIBase + "/accounts"
+
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		email := fmt.Sprintf("%s@duckmail.sbs", generateDuckMailPrefix())
+		password := generateDuckMailPassword()
+		payload := map[string]string{
+			"address":  email,
+			"password": password,
+		}
+		status, respBody, err := doJSONRequest(http.MethodPost, registerURL, headers, payload, 15*time.Second)
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Second)
+			continue
+		}
+		if status == http.StatusCreated {
+			log.Printf("📨 [邮箱渠道 provider=%s] 已创建邮箱: %s, 密码: %s", MailProviderDuckMail, email, password)
+			return &InboxSession{
+				Provider: MailProviderDuckMail,
+				Email:    email,
+				Password: password,
+			}, nil
+		}
+
+		var data map[string]interface{}
+		_ = json.Unmarshal(respBody, &data)
+		address := strings.TrimSpace(fmt.Sprint(data["address"]))
+		if status == http.StatusOK && address == email {
+			log.Printf("📨 [邮箱渠道 provider=%s] 已创建邮箱: %s, 密码: %s", MailProviderDuckMail, email, password)
+			return &InboxSession{
+				Provider: MailProviderDuckMail,
+				Email:    email,
+				Password: password,
+			}, nil
+		}
+
+		msg := strings.ToLower(strings.TrimSpace(fmt.Sprint(data["message"])))
+		if strings.Contains(msg, "already exists") {
+			lastErr = fmt.Errorf("邮箱已存在")
+			continue
+		}
+
+		lastErr = fmt.Errorf("status=%d body=%s", status, string(respBody[:min(200, len(respBody))]))
+		time.Sleep(time.Second)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("未知错误")
+	}
+	return nil, fmt.Errorf("创建 duckmail 邮箱失败: %w", lastErr)
+}
+
+func getDuckMailToken(email, password string) (string, error) {
+	email = strings.TrimSpace(email)
+	password = strings.TrimSpace(password)
+	if email == "" || password == "" {
+		return "", fmt.Errorf("duckmail 账号凭据不完整")
+	}
+
+	payload := map[string]string{
+		"address":  email,
+		"password": password,
+	}
+	status, respBody, err := doJSONRequest(http.MethodPost, duckMailAPIBase+"/token", nil, payload, 15*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("获取 token 失败: status=%d body=%s", status, string(respBody[:min(200, len(respBody))]))
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(respBody, &data); err != nil {
+		return "", fmt.Errorf("解析 token 响应失败: %w", err)
+	}
+	token := strings.TrimSpace(fmt.Sprint(data["token"]))
+	if token == "" || token == "<nil>" {
+		return "", fmt.Errorf("token 为空")
+	}
+	return token, nil
+}
+
+func getDuckMailMessageList(token string) ([]map[string]interface{}, error) {
+	headers := map[string]string{
+		"Authorization": "Bearer " + token,
+	}
+	status, respBody, err := doJSONRequest(http.MethodGet, duckMailAPIBase+"/messages", headers, nil, 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("获取消息列表失败: status=%d body=%s", status, string(respBody[:min(200, len(respBody))]))
+	}
+
+	var root interface{}
+	if err := json.Unmarshal(respBody, &root); err != nil {
+		return nil, fmt.Errorf("解析消息列表失败: %w", err)
+	}
+
+	var rawMessages []interface{}
+	switch data := root.(type) {
+	case []interface{}:
+		rawMessages = data
+	case map[string]interface{}:
+		if member, ok := data["hydra:member"].([]interface{}); ok {
+			rawMessages = member
+		}
+		if len(rawMessages) == 0 {
+			if member, ok := data["member"].([]interface{}); ok {
+				rawMessages = member
+			}
+		}
+		if len(rawMessages) == 0 {
+			if member, ok := data["data"].([]interface{}); ok {
+				rawMessages = member
+			}
+		}
+	}
+
+	messages := make([]map[string]interface{}, 0, len(rawMessages))
+	for _, item := range rawMessages {
+		msg, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	return messages, nil
+}
+
+func getDuckMailMessageDetail(token, messageID string) (map[string]interface{}, error) {
+	headers := map[string]string{
+		"Authorization": "Bearer " + token,
+	}
+	url := fmt.Sprintf("%s/messages/%s", duckMailAPIBase, messageID)
+	status, respBody, err := doJSONRequest(http.MethodGet, url, headers, nil, 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("获取消息详情失败: status=%d body=%s", status, string(respBody[:min(200, len(respBody))]))
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(respBody, &data); err != nil {
+		return nil, fmt.Errorf("解析消息详情失败: %w", err)
+	}
+	return data, nil
+}
+
+func extractDuckMailMessageID(msg map[string]interface{}) string {
+	if msg == nil {
+		return ""
+	}
+	id := strings.TrimSpace(fmt.Sprint(msg["id"]))
+	if id == "" || id == "<nil>" {
+		id = strings.TrimSpace(fmt.Sprint(msg["@id"]))
+	}
+	if id == "" || id == "<nil>" {
+		return ""
+	}
+	id = strings.TrimPrefix(id, "/messages/")
+	parts := strings.Split(id, "/")
+	return strings.TrimSpace(parts[len(parts)-1])
 }
 
 func getTemporaryEmail() (string, error) {
@@ -290,9 +626,10 @@ func getEmailFromProvider(provider TempMailProvider) (string, error) {
 }
 func getEmailCount(email string) int {
 	for retry := 0; retry < 3; retry++ {
-		req, _ := http.NewRequest("GET", fmt.Sprintf("https://mail.chatgpt.org.uk/api/emails?email=%s", email), nil)
+		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/emails?email=%s", scriptMailAPI, email), nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-		req.Header.Set("Referer", "https://mail.chatgpt.org.uk")
+		req.Header.Set("Referer", scriptMailAPI)
+		req.Header.Set("X-API-Key", scriptMailKey)
 
 		client := &http.Client{Timeout: 15 * time.Second}
 		if httpClient != nil {
@@ -312,6 +649,27 @@ func getEmailCount(email string) int {
 		return len(result.Data.Emails)
 	}
 	return 0
+}
+
+func getEmailCountByInbox(inbox InboxSession) int {
+	switch strings.ToLower(strings.TrimSpace(inbox.Provider)) {
+	case MailProviderDuckMail:
+		token, err := getDuckMailToken(inbox.Email, inbox.Password)
+		if err != nil {
+			log.Printf("⚠️ [验证码 provider=%s] 获取 token 失败: %v", MailProviderDuckMail, err)
+			return 0
+		}
+		messages, err := getDuckMailMessageList(token)
+		if err != nil {
+			log.Printf("⚠️ [验证码 provider=%s] 获取邮件数量失败: %v", MailProviderDuckMail, err)
+			return 0
+		}
+		return len(messages)
+	case MailProviderChatGPT:
+		fallthrough
+	default:
+		return getEmailCount(inbox.Email)
+	}
 }
 
 type VerificationState struct {
@@ -369,9 +727,10 @@ func getVerificationEmailWithState(email string, retries int, intervalSec int, i
 		client = httpClient
 	}
 	for i := 0; i < retries; i++ {
-		req, _ := http.NewRequest("GET", fmt.Sprintf("https://mail.chatgpt.org.uk/api/emails?email=%s", email), nil)
+		req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/emails?email=%s", scriptMailAPI, email), nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-		req.Header.Set("Referer", "https://mail.chatgpt.org.uk")
+		req.Header.Set("Referer", scriptMailAPI)
+		req.Header.Set("X-API-Key", scriptMailKey)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -386,17 +745,41 @@ func getVerificationEmailWithState(email string, retries int, intervalSec int, i
 			time.Sleep(time.Duration(intervalSec) * time.Second)
 			continue
 		}
-		if result.Success && len(result.Data.Emails) > initialCount {
+		log.Printf("🔎 [验证码 provider=%s] 轮询邮箱=%s (第 %d/%d 次): 邮件数=%d, 基准=%d",
+			MailProviderChatGPT, email, i+1, retries, len(result.Data.Emails), initialCount)
+		if len(result.Data.Emails) > initialCount {
 			for idx := 0; idx < len(result.Data.Emails)-initialCount; idx++ {
 				latestEmail := &result.Data.Emails[idx]
-				code, err := extractVerificationCode(latestEmail.Content)
+				// 对齐 reg_gemini.py：优先读取 html_content，再回退 content/text_content
+				mailContent := latestEmail.HTMLContent
+				if mailContent == "" {
+					mailContent = latestEmail.Content
+				}
+				if mailContent == "" {
+					mailContent = latestEmail.TextContent
+				}
+				if mailContent == "" {
+					log.Printf("⚠️ [验证码 provider=%s] 邮件缺少正文: subject=%q", MailProviderChatGPT, latestEmail.Subject)
+					continue
+				}
+				log.Printf("📩 [验证码 provider=%s] 收到邮件 subject=%q", MailProviderChatGPT, latestEmail.Subject)
+				preview := mailContent
+				if len(preview) > 1000 {
+					preview = preview[:1000] + "...(截断)"
+				}
+				log.Printf("📄 [验证码邮件正文开始]\n%s\n📄 [验证码邮件正文结束]", preview)
+
+				code, err := extractVerificationCode(mailContent)
 				if err != nil {
+					log.Printf("⚠️ [验证码 provider=%s] 邮件存在但未提取到验证码: %v", MailProviderChatGPT, err)
 					continue
 				}
 				if state != nil && state.IsCodeUsed(code) {
 					log.Printf("[验证码] 跳过已使用的验证码: %s", code)
 					continue
 				}
+				log.Printf("✅ [验证码 provider=%s] 提取到验证码: %s", MailProviderChatGPT, code)
+				latestEmail.Content = mailContent
 				return latestEmail, nil
 			}
 			log.Printf("[验证码] 所有新邮件的验证码均已使用，等待新邮件...")
@@ -404,6 +787,142 @@ func getVerificationEmailWithState(email string, retries int, intervalSec int, i
 		time.Sleep(time.Duration(intervalSec) * time.Second)
 	}
 	return nil, fmt.Errorf("未收到新的验证码邮件")
+}
+
+func getDuckMailVerificationEmail(inbox InboxSession, retries int, intervalSec int, initialCount int, state *VerificationState) (*EmailContent, error) {
+	for i := 0; i < retries; i++ {
+		log.Printf("🔎 [验证码 provider=%s] 开始轮询邮箱=%s (第 %d/%d 次)", MailProviderDuckMail, inbox.Email, i+1, retries)
+		token, err := getDuckMailToken(inbox.Email, inbox.Password)
+		if err != nil {
+			log.Printf("⚠️ [验证码 provider=%s] 获取 token 失败: %v", MailProviderDuckMail, err)
+			time.Sleep(time.Duration(intervalSec) * time.Second)
+			continue
+		}
+
+		messages, err := getDuckMailMessageList(token)
+		if err != nil {
+			log.Printf("⚠️ [验证码 provider=%s] 获取邮件列表失败: %v", MailProviderDuckMail, err)
+			time.Sleep(time.Duration(intervalSec) * time.Second)
+			continue
+		}
+		log.Printf("📬 [验证码 provider=%s] 当前邮件数量=%d, 基准数量=%d", MailProviderDuckMail, len(messages), initialCount)
+
+		if len(messages) > initialCount {
+			newCount := len(messages) - initialCount
+			for idx := 0; idx < newCount; idx++ {
+				msgID := extractDuckMailMessageID(messages[idx])
+				if msgID == "" {
+					continue
+				}
+				detail, err := getDuckMailMessageDetail(token, msgID)
+				if err != nil {
+					continue
+				}
+
+				subject := strings.TrimSpace(fmt.Sprint(detail["subject"]))
+				if subject == "<nil>" {
+					subject = ""
+				}
+				content := strings.TrimSpace(fmt.Sprint(detail["text"]))
+				if content == "" || content == "<nil>" {
+					content = strings.TrimSpace(fmt.Sprint(detail["html"]))
+				}
+				if content == "" || content == "<nil>" {
+					continue
+				}
+				log.Printf("📩 [验证码 provider=%s] 收到邮件 id=%s subject=%q", MailProviderDuckMail, msgID, subject)
+				log.Printf("📄 [验证码邮件正文开始]\n%s\n📄 [验证码邮件正文结束]", content)
+
+				code, err := extractVerificationCode(content)
+				if err != nil {
+					log.Printf("⚠️ [验证码 provider=%s] 邮件存在但未提取到验证码: %v", MailProviderDuckMail, err)
+					continue
+				}
+				if state != nil && state.IsCodeUsed(code) {
+					log.Printf("[验证码 provider=%s] 跳过已使用的验证码: %s", MailProviderDuckMail, code)
+					continue
+				}
+				log.Printf("✅ [验证码 provider=%s] 提取到验证码: %s", MailProviderDuckMail, code)
+				return &EmailContent{
+					Subject: subject,
+					Content: content,
+				}, nil
+			}
+		}
+
+		time.Sleep(time.Duration(intervalSec) * time.Second)
+	}
+	return nil, fmt.Errorf("未收到新的验证码邮件")
+}
+
+func getVerificationEmailByInbox(inbox InboxSession, retries int, intervalSec int, initialCount int, state *VerificationState) (*EmailContent, error) {
+	switch strings.ToLower(strings.TrimSpace(inbox.Provider)) {
+	case MailProviderDuckMail:
+		return getDuckMailVerificationEmail(inbox, retries, intervalSec, initialCount, state)
+	case MailProviderChatGPT:
+		fallthrough
+	default:
+		return getVerificationEmailWithState(inbox.Email, retries, intervalSec, initialCount, state)
+	}
+}
+
+func buildRefreshInboxCandidates(acc *pool.Account) []InboxSession {
+	if acc == nil {
+		return nil
+	}
+
+	email := strings.TrimSpace(acc.Data.Email)
+	password := acc.Data.MailPassword
+	preferred := strings.ToLower(strings.TrimSpace(acc.Data.MailProvider))
+	if preferred == "" {
+		preferred = MailProviderChatGPT
+	}
+
+	seen := make(map[string]bool)
+	var candidates []InboxSession
+	appendCandidate := func(provider string) {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider != MailProviderChatGPT && provider != MailProviderDuckMail {
+			return
+		}
+		if seen[provider] {
+			return
+		}
+		seen[provider] = true
+		candidate := InboxSession{
+			Provider: provider,
+			Email:    email,
+		}
+		if provider == MailProviderDuckMail {
+			candidate.Password = password
+		}
+		candidates = append(candidates, candidate)
+	}
+
+	appendCandidate(preferred)
+	for _, provider := range getMailChannelOrder() {
+		appendCandidate(provider)
+	}
+	return candidates
+}
+
+func getVerificationEmailWithFallback(candidates []InboxSession, retries int, intervalSec int, initialCounts map[string]int) (*EmailContent, string, error) {
+	var lastErr error
+	for _, inbox := range candidates {
+		initialCount := initialCounts[inbox.Provider]
+		emailContent, err := getVerificationEmailByInbox(inbox, retries, intervalSec, initialCount, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if emailContent != nil {
+			return emailContent, inbox.Provider, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("未收到新的验证码邮件")
+	}
+	return nil, "", lastErr
 }
 
 // PageState 页面状态类型
@@ -1275,13 +1794,17 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 	}()
 
-	// 获取临时邮箱
-	email, err := getTemporaryEmail()
+	// 获取临时邮箱（支持多渠道）
+	inbox, err := createInboxWithFallback()
 	if err != nil {
 		result.Error = err
 		return result
 	}
+	email := inbox.Email
 	result.Email = email
+	result.MailProvider = inbox.Provider
+	result.MailPassword = inbox.Password
+	log.Printf("[注册 %d] 使用邮箱渠道 provider=%s, email=%s", threadID, inbox.Provider, email)
 
 	// 启动浏览器 - 使用统一的浏览器查找逻辑
 	l := launcher.New()
@@ -1351,12 +1874,29 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			csesidx = m[1]
 		}
 	})()
-	if err := page.Navigate("https://business.gemini.google"); err != nil {
-		result.Error = fmt.Errorf("打开页面失败: %w", err)
-		return result
+
+	entryUsed := "script_login_url"
+	if err := page.Navigate(scriptLoginURL); err != nil {
+		log.Printf("[注册 %d] ⚠️ 打开脚本登录入口失败，回退默认入口: %v", threadID, err)
+		entryUsed = "fallback"
+		if err := page.Navigate("https://business.gemini.google"); err != nil {
+			result.Error = fmt.Errorf("打开页面失败: %w", err)
+			return result
+		}
 	}
 	page.WaitLoad()
 	time.Sleep(1 * time.Second)
+	if _, err := page.Timeout(8 * time.Second).Element("input"); err != nil && entryUsed != "fallback" {
+		log.Printf("[注册 %d] ⚠️ 脚本入口未出现输入框，回退默认入口", threadID)
+		entryUsed = "fallback"
+		if err := page.Navigate("https://business.gemini.google"); err != nil {
+			result.Error = fmt.Errorf("打开回退页面失败: %w", err)
+			return result
+		}
+		page.WaitLoad()
+		time.Sleep(1 * time.Second)
+	}
+	log.Printf("[注册 %d] 注册入口 entry=%s", threadID, entryUsed)
 
 	// 检查是否被代理403阻止
 	statusCheck, _ := page.Eval(`() => {
@@ -1441,6 +1981,11 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	log.Printf("[注册 %d] 准备输入邮箱: %s", threadID, email)
 	time.Sleep(500 * time.Millisecond)
 	var emailInput *rod.Element
+	if strictEmailInput, ok := findVisibleElementByXPath(page, scriptEmailInputXPath, 4*time.Second); ok {
+		emailInput = strictEmailInput
+		log.Printf("[注册 %d] 邮箱输入框定位模式: strict_xpath", threadID)
+	}
+
 	selectors := []string{
 		"#email-input",            // Google Business 特定 ID
 		"input[name='loginHint']", // Google Business 特定 name
@@ -1449,16 +1994,19 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		"input[type='text'][aria-label]",
 		"input:not([type='hidden']):not([type='submit']):not([type='checkbox'])",
 	}
-	for _, sel := range selectors {
-		el, err := page.Timeout(3 * time.Second).Element(sel)
-		if err != nil {
-			continue
-		}
-		if el != nil {
-			visible, _ := el.Visible()
-			if visible {
-				emailInput = el
-				break
+	if emailInput == nil {
+		for _, sel := range selectors {
+			el, err := page.Timeout(3 * time.Second).Element(sel)
+			if err != nil {
+				continue
+			}
+			if el != nil {
+				visible, _ := el.Visible()
+				if visible {
+					emailInput = el
+					log.Printf("[注册 %d] 邮箱输入框定位模式: fallback_selector(%s)", threadID, sel)
+					break
+				}
 			}
 		}
 	}
@@ -1538,7 +2086,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	log.Printf("[注册 %d] 🗑️ 清空输入框...", threadID)
 	// 先检查当前是否有内容
 	currentVal, _ := emailInput.Property("value")
-	if currentVal.String() != "" {
+	if strings.TrimSpace(currentVal.Str()) != "" {
 		emailInput.SelectAllText()
 		humanDelay(80, 150)
 		page.Keyboard.Type(input.Backspace)
@@ -1553,12 +2101,50 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	time.Sleep(500 * time.Millisecond)
 
 	// 验证输入
-	propVal, _ := emailInput.Property("value")
-	inputValue := propVal.String()
+	readEmailInputValue := func() string {
+		valueResult, err := page.Eval(`() => {
+			const input = document.querySelector('#email-input') ||
+				document.querySelector('input[name="loginHint"]') ||
+				document.querySelector('input[type="email"]') ||
+				document.querySelector('input[type="text"]');
+			if (!input) return '';
+			return String(input.value || '');
+		}`)
+		if err != nil || valueResult == nil {
+			return ""
+		}
+		return strings.TrimSpace(valueResult.Value.Str())
+	}
+
+	inputValue := readEmailInputValue()
 	log.Printf("[注册 %d] 📋 最终输入值: [%s]", threadID, inputValue)
 
 	if inputValue != email {
-	} else {
+		log.Printf("[注册 %d] ⚠️ 邮箱值校验失败，执行 JS 补偿赋值", threadID)
+		page.Eval(fmt.Sprintf(`() => {
+			const input = document.querySelector('#email-input') ||
+				document.querySelector('input[name="loginHint"]') ||
+				document.querySelector('input[type="email"]') ||
+				document.querySelector('input[type="text"]');
+			if (!input) return false;
+			input.value = %q;
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+			input.dispatchEvent(new Event('change', { bubbles: true }));
+			return true;
+		}`, email))
+		humanDelay(300, 600)
+		inputValue = readEmailInputValue()
+		log.Printf("[注册 %d] 📋 JS补偿后输入值: [%s]", threadID, inputValue)
+		if inputValue != email {
+			// 某些页面输入值读取会返回空，但后续按钮交互仍可成功，避免在此处误杀流程
+			if inputValue != "" {
+				result.Error = fmt.Errorf("邮箱输入值校验失败: expected=%s actual=%s", email, inputValue)
+				return result
+			}
+			log.Printf("[注册 %d] ⚠️ 输入值读取为空，继续尝试点击继续按钮", threadID)
+		}
+	}
+	if inputValue == email {
 		log.Printf("[注册 %d] ✅ 输入验证成功", threadID)
 	}
 
@@ -1572,7 +2158,23 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	time.Sleep(500 * time.Millisecond)
 	debugScreenshot(page, threadID, "03_before_submit")
 	emailSubmitted := false
-	for i := 0; i < 8; i++ {
+	if strictContinueBtn, ok := findVisibleElementByXPath(page, scriptContinueBtnXPath, 3*time.Second); ok {
+		log.Printf("[注册 %d] 继续按钮定位模式: strict_xpath", threadID)
+		if clickByXPathJS(page, scriptContinueBtnXPath) {
+			emailSubmitted = true
+			log.Printf("[注册 %d] 继续按钮点击模式: strict_xpath_js", threadID)
+		} else {
+			if err := strictContinueBtn.Click(proto.InputMouseButtonLeft, 1); err != nil {
+				log.Printf("[注册 %d] ⚠️ strict 点击失败: %v", threadID, err)
+			} else {
+				emailSubmitted = true
+				log.Printf("[注册 %d] 继续按钮点击模式: strict_xpath_native", threadID)
+			}
+		}
+		humanDelay(300, 600)
+	}
+
+	for i := 0; i < 8 && !emailSubmitted; i++ {
 		// 拟人化延迟（模拟人类寻找按钮的时间）
 		humanDelay(200, 500)
 
@@ -1651,14 +2253,23 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		// 检查页面是否已经离开邮箱输入页面
 		transitionResult, _ := page.Eval(`() => {
 			const pageText = document.body ? document.body.textContent : '';
-			const emailInput = document.querySelector('input[type="email"]');
-			const continueBtn = document.querySelector('button[jsname="LgbsSe"]');
-			const stillOnEmailPage = (emailInput && emailInput.offsetParent !== null) || 
-				(continueBtn && continueBtn.innerText && 
-				 (continueBtn.innerText.includes('继续') || continueBtn.innerText.includes('Continue')));
+			const emailInput = document.querySelector('#email-input') ||
+				document.querySelector('input[name="loginHint"]') ||
+				document.querySelector('input[type="email"]') ||
+				document.querySelector('input[type="text"]');
+			const continueBtn = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'))
+				.find(el => {
+					if (!el || el.offsetParent === null) return false;
+					const text = (el.textContent || '').trim().toLowerCase();
+					return text.includes('continue with email') || text.includes('continue') || text.includes('继续');
+				});
+			const stillOnEmailPage = !!(emailInput && emailInput.offsetParent !== null && continueBtn);
+			const hasPinInput = !!document.querySelector("input[name='pinInput']");
+			const hasOtpSpan = !!document.querySelector("span[data-index='0']");
 			const isVerifyPage = pageText.includes('验证') || pageText.includes('Verify') || 
 				pageText.includes('输入代码') || pageText.includes('Enter code') ||
-				pageText.includes('发送到') || pageText.includes('sent to');
+				pageText.includes('发送到') || pageText.includes('sent to') ||
+				hasPinInput || hasOtpSpan;
 			const isNamePage = pageText.includes('姓氏') || pageText.includes('名字') || 
 				pageText.includes('Full name') || pageText.includes('全名');
 			const errorElement = document.querySelector('.zyTWof-Ng57nc, .zyTWof-gIZMF');
@@ -1713,39 +2324,94 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	if !pageTransitioned {
 		// 页面没有跳转，可能需要重新点击按钮
 		log.Printf("[注册 %d] 页面未跳转，尝试重新点击按钮", threadID)
-		page.Eval(`() => {
-			const btn = document.querySelector('button[jsname="LgbsSe"]');
-			if (btn) btn.click();
+		clicked := clickByXPathJS(page, scriptContinueBtnXPath)
+		if !clicked {
+			clickResult, _ := page.Eval(`() => {
+				const btn = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'))
+					.find(el => {
+						if (!el || el.offsetParent === null || el.disabled) return false;
+						const text = (el.textContent || '').trim().toLowerCase();
+						return text.includes('continue with email') || text.includes('continue') || text.includes('继续');
+					});
+				if (!btn) return false;
+				btn.click();
+				return true;
+			}`)
+			clicked = clickResult != nil && clickResult.Value.Bool()
+		}
+		time.Sleep(2 * time.Second)
+
+		retryCheck, _ := page.Eval(`() => {
+			const pageText = document.body ? document.body.textContent : '';
+			const emailInput = document.querySelector('#email-input') ||
+				document.querySelector('input[name="loginHint"]') ||
+				document.querySelector('input[type="email"]') ||
+				document.querySelector('input[type="text"]');
+			const continueBtn = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'))
+				.find(el => {
+					if (!el || el.offsetParent === null) return false;
+					const text = (el.textContent || '').trim().toLowerCase();
+					return text.includes('continue with email') || text.includes('continue') || text.includes('继续');
+				});
+			const isEmailPage = !!(emailInput && emailInput.offsetParent !== null && continueBtn);
+			const hasPinInput = !!document.querySelector("input[name='pinInput']");
+			const hasOtpSpan = !!document.querySelector("span[data-index='0']");
+			const isVerifyPage = hasPinInput || hasOtpSpan ||
+				pageText.includes('验证码') || pageText.includes('verification') ||
+				pageText.includes('verify') || pageText.includes('code');
+			const isNamePage = pageText.includes('姓氏') || pageText.includes('名字') ||
+				pageText.includes('Full name') || pageText.includes('全名');
+			return { isEmailPage, isVerifyPage, isNamePage };
 		}`)
-		time.Sleep(3 * time.Second)
-		needsVerification = true // 假设需要验证
+		if retryCheck != nil {
+			if retryCheck.Value.Get("isEmailPage").Bool() {
+				result.Error = fmt.Errorf("点击继续后仍停留在邮箱输入页，未触发验证码流程")
+				return result
+			}
+			needsVerification = retryCheck.Value.Get("isVerifyPage").Bool()
+		} else if clicked {
+			needsVerification = true
+		}
 	}
 
 	// 再次检查页面状态
 	checkResult, _ := page.Eval(`() => {
 		const pageText = document.body ? document.body.textContent : '';
+		const emailInput = document.querySelector('#email-input') ||
+			document.querySelector('input[name="loginHint"]') ||
+			document.querySelector('input[type="email"]') ||
+			document.querySelector('input[type="text"]');
+		const continueBtn = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'))
+			.find(el => {
+				if (!el || el.offsetParent === null) return false;
+				const text = (el.textContent || '').trim().toLowerCase();
+				return text.includes('continue with email') || text.includes('continue') || text.includes('继续');
+			});
+		const isEmailPage = !!(emailInput && emailInput.offsetParent !== null && continueBtn);
+		const hasPinInput = !!document.querySelector("input[name='pinInput']");
+		const hasOtpSpan = !!document.querySelector("span[data-index='0']");
 		
 		// 检查常见错误
 		if (pageText.includes('出了点问题') || pageText.includes('Something went wrong') ||
 			pageText.includes('无法创建') || pageText.includes('cannot create') ||
 			pageText.includes('不安全') || pageText.includes('secure') ||
 			pageText.includes('电话') || pageText.includes('Phone') || pageText.includes('number')) {
-			return { error: true, text: document.body.innerText.substring(0, 100) };
+			return { error: true, text: document.body.innerText.substring(0, 100), isEmailPage };
 		}
 
 		// 检查是否需要验证码
-		if (pageText.includes('验证') || pageText.includes('Verify') || 
+		if (hasPinInput || hasOtpSpan || pageText.includes('验证') || pageText.includes('Verify') || 
 			pageText.includes('code') || pageText.includes('sent')) {
-			return { needsVerification: true, isNamePage: false };
+			return { needsVerification: true, isNamePage: false, isEmailPage: false };
 		}
 		
 		// 检查是否已经到了姓名页面
 		if (pageText.includes('姓氏') || pageText.includes('名字') || 
 			pageText.includes('Full name') || pageText.includes('全名')) {
-			return { needsVerification: false, isNamePage: true };
+			return { needsVerification: false, isNamePage: true, isEmailPage: false };
 		}
 		
-		return { needsVerification: true, isNamePage: false };
+		return { needsVerification: false, isNamePage: false, isEmailPage: isEmailPage };
 	}`)
 
 	if checkResult != nil {
@@ -1757,9 +2423,14 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 		needsVerification = checkResult.Value.Get("needsVerification").Bool()
 		isNamePage := checkResult.Value.Get("isNamePage").Bool()
-		log.Printf("[注册 %d] 页面状态: needsVerification=%v, isNamePage=%v", threadID, needsVerification, isNamePage)
+		isEmailPage := checkResult.Value.Get("isEmailPage").Bool()
+		log.Printf("[注册 %d] 页面状态: needsVerification=%v, isNamePage=%v, isEmailPage=%v", threadID, needsVerification, isNamePage, isEmailPage)
+		if isEmailPage {
+			result.Error = fmt.Errorf("提交邮箱后仍停留在邮箱页，未进入验证码流程")
+			return result
+		}
 	} else {
-		needsVerification = true
+		needsVerification = false
 	}
 
 	// 检测并处理 signin-error 页面（被检测到后的恢复）
@@ -1895,13 +2566,16 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	if needsVerification {
 
 		var emailContent *EmailContent
-		maxWaitTime := 3 * time.Minute
+		initialEmailCount := getEmailCountByInbox(*inbox)
+		maxWaitTime := 30 * time.Second
 		startTime := time.Now()
 		resendCount := 0
 		maxResend := 3
 		lastEmailCheck := time.Time{}
 		emailCheckInterval := 3 * time.Second
 		codePageStableTime := time.Time{} // 验证码页面稳定时间
+		log.Printf("[注册 %d] [验证码轮询] provider=%s, baseline_count=%d, timeout=%s",
+			threadID, inbox.Provider, initialEmailCount, maxWaitTime)
 
 		for time.Since(startTime) < maxWaitTime {
 			// 检查页面状态
@@ -2028,14 +2702,19 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 						}
 					}`)
 					resendCount++
+					initialEmailCount = getEmailCountByInbox(*inbox)
 					time.Sleep(3 * time.Second)
 					continue
 				}
 				if time.Since(lastEmailCheck) >= emailCheckInterval {
-					emailContent, _ = getVerificationEmailQuick(email, 1, 2)
+					currentEmailCount := getEmailCountByInbox(*inbox)
+					hasNewMail := currentEmailCount > initialEmailCount
+					log.Printf("[注册 %d] [验证码轮询] provider=%s count=%d baseline=%d has_new=%v",
+						threadID, inbox.Provider, currentEmailCount, initialEmailCount, hasNewMail)
+					emailContent, _ = getVerificationEmailByInbox(*inbox, 1, 1, initialEmailCount, nil)
 					lastEmailCheck = time.Now()
 					if emailContent != nil {
-						log.Printf("[注册 %d] ✅ 获取到验证码邮件", threadID)
+						log.Printf("[注册 %d] ✅ 获取到验证码邮件 provider=%s", threadID, inbox.Provider)
 						break
 					}
 				}
@@ -2045,7 +2724,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 
 		if emailContent == nil {
-			result.Error = fmt.Errorf("无法获取验证码邮件")
+			result.Error = fmt.Errorf("30秒内未收到验证码邮件")
 			return result
 		}
 
@@ -2091,52 +2770,103 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 				inputInfo.Value.Get("count").Int(), isOTP)
 		}
 
-		// 使用 rod Element API 查找验证码输入框
-		codeInputs, _ := page.Elements("input:not([type='hidden'])")
-		var firstCodeInput *rod.Element
-		for _, el := range codeInputs {
-			visible, _ := el.Visible()
-			if visible {
-				firstCodeInput = el
-				break
+		codeInputDone := false
+
+		// 对齐 reg_gemini.py：优先 input[name='pinInput']
+		if pinInput, err := page.Timeout(4 * time.Second).Element("input[name='pinInput']"); err == nil && pinInput != nil {
+			if visible, _ := pinInput.Visible(); visible {
+				log.Printf("[注册 %d] 验证码输入框定位模式: pinInput", threadID)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[注册 %d] pinInput 输入异常: %v", threadID, r)
+						}
+					}()
+					humanClick(page, pinInput)
+					humanDelay(150, 300)
+					pinInput.SelectAllText()
+					pinInput.Input("")
+					humanDelay(120, 240)
+					humanType(page, code)
+					codeInputDone = true
+				}()
 			}
 		}
 
-		if firstCodeInput == nil {
-			log.Printf("[注册 %d] ⚠️ 未找到验证码输入框", threadID)
-		} else {
-			// 使用拟人化点击验证码框
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("[注册 %d] 点击验证码框异常: %v", threadID, r)
-					}
-				}()
-				humanClick(page, firstCodeInput)
-			}()
-			humanDelay(200, 400)
+		// 回退：span[data-index='0']，然后向焦点输入验证码
+		if !codeInputDone {
+			if spanInput, err := page.Timeout(2 * time.Second).Element("span[data-index='0']"); err == nil && spanInput != nil {
+				if visible, _ := spanInput.Visible(); visible {
+					log.Printf("[注册 %d] 验证码输入框定位模式: span[data-index='0']", threadID)
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								log.Printf("[注册 %d] span OTP 输入异常: %v", threadID, r)
+							}
+						}()
+						humanClick(page, spanInput)
+						humanDelay(150, 300)
+						for _, char := range code {
+							page.Keyboard.Type(input.Key(char))
+							humanDelay(50, 120)
+						}
+						codeInputDone = true
+					}()
+				}
+			}
+		}
 
-			// 清空输入框（带超时保护）
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("[注册 %d] 清空验证码框异常: %v", threadID, r)
-					}
+		// 最后兜底：使用第一个可见输入框
+		if !codeInputDone {
+			codeInputs, _ := page.Elements("input:not([type='hidden'])")
+			var firstCodeInput *rod.Element
+			for _, el := range codeInputs {
+				visible, _ := el.Visible()
+				if visible {
+					firstCodeInput = el
+					break
+				}
+			}
+			if firstCodeInput == nil {
+				log.Printf("[注册 %d] ⚠️ 未找到验证码输入框", threadID)
+			} else {
+				log.Printf("[注册 %d] 验证码输入框定位模式: fallback_input", threadID)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[注册 %d] fallback 输入异常: %v", threadID, r)
+						}
+					}()
+					humanClick(page, firstCodeInput)
+					humanDelay(200, 400)
+					firstCodeInput.SelectAllText()
+					firstCodeInput.Input("")
+					humanDelay(150, 300)
+					humanType(page, code)
+					codeInputDone = true
 				}()
-				firstCodeInput.SelectAllText()
-				firstCodeInput.Input("")
-			}()
-			humanDelay(150, 300)
+			}
+		}
 
-			// 使用拟人化打字输入验证码
-			log.Printf("[注册 %d] ⌨️ 开始拟人化输入验证码...", threadID)
-			humanType(page, code)
+		if codeInputDone {
 			log.Printf("[注册 %d] 验证码输入完成", threadID)
 		}
 
 		humanDelay(400, 700)
 
-		for i := 0; i < 5; i++ {
+		verifySubmitted := false
+		if strictVerifyBtn, ok := findVisibleElementByXPath(page, scriptVerifyBtnXPath, 3*time.Second); ok {
+			log.Printf("[注册 %d] 验证按钮定位模式: strict_xpath", threadID)
+			if err := strictVerifyBtn.Click(proto.InputMouseButtonLeft, 1); err != nil {
+				log.Printf("[注册 %d] ⚠️ strict 验证按钮原生点击失败，回退 JS click: %v", threadID, err)
+				verifySubmitted = clickByXPathJS(page, scriptVerifyBtnXPath)
+			} else {
+				verifySubmitted = true
+			}
+			humanDelay(300, 600)
+		}
+
+		for i := 0; i < 5 && !verifySubmitted; i++ {
 			clickResult, _ := page.Eval(`() => {
 				const targets = ['验证', 'Verify', '继续', 'Next', 'Continue'];
 				const elements = [
@@ -2162,6 +2892,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
 				humanDelay(300, 600)
+				verifySubmitted = true
 				break
 			}
 			humanDelay(800, 1200)
@@ -2471,6 +3202,8 @@ func SaveBrowserRegisterResult(result *BrowserRegisterResult, dataDir string) er
 	data := pool.AccountData{
 		Email:         result.Email,
 		FullName:      result.FullName,
+		MailProvider:  result.MailProvider,
+		MailPassword:  result.MailPassword,
 		Authorization: result.Authorization,
 		Cookies:       result.Cookies,
 		ConfigID:      result.ConfigID,
@@ -2586,9 +3319,21 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 	if info != nil {
 		currentURL = info.URL
 	}
-	_ = currentURL // 后续 extractResult 中使用
-	initialEmailCount := 0
+	_ = currentURL      // 后续 extractResult 中使用
 	maxCodeRetries := 3 // 验证码重试次数（必须在goto之前声明）
+	inboxCandidates := buildRefreshInboxCandidates(acc)
+	if len(inboxCandidates) == 0 {
+		inboxCandidates = []InboxSession{{
+			Provider: MailProviderChatGPT,
+			Email:    email,
+		}}
+	}
+	providers := make([]string, 0, len(inboxCandidates))
+	for _, inbox := range inboxCandidates {
+		providers = append(providers, inbox.Provider)
+	}
+	log.Printf("[Cookie刷新] [%s] 邮箱渠道候选: %v", email, providers)
+	initialEmailCounts := make(map[string]int)
 
 	// 检查是否已经登录成功（有authorization）
 	if authorization != "" {
@@ -2597,7 +3342,11 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 	}
 
 	// 获取实际邮件数量
-	initialEmailCount = getEmailCount(email)
+	for _, inbox := range inboxCandidates {
+		count := getEmailCountByInbox(inbox)
+		initialEmailCounts[inbox.Provider] = count
+		log.Printf("[Cookie刷新] [%s] 渠道 provider=%s 初始邮件数: %d", email, inbox.Provider, count)
+	}
 
 	// 检查是否在登录页面需要输入邮箱
 	if _, err := page.Timeout(5 * time.Second).Element("input"); err == nil {
@@ -2711,7 +3460,9 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 			}`)
 			time.Sleep(2 * time.Second)
 			// 更新邮件计数基准
-			initialEmailCount = getEmailCount(email)
+			for _, inbox := range inboxCandidates {
+				initialEmailCounts[inbox.Provider] = getEmailCountByInbox(inbox)
+			}
 		}
 
 		var emailContent *EmailContent
@@ -2719,9 +3470,11 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 		startTime := time.Now()
 
 		for time.Since(startTime) < maxWaitTime {
-			// 快速检查新邮件（只接受数量增加的情况）
-			emailContent, _ = getVerificationEmailAfter(email, 1, 1, initialEmailCount)
+			// 快速检查新邮件（按账号渠道优先，失败时按全局顺序回退）
+			var providerUsed string
+			emailContent, providerUsed, _ = getVerificationEmailWithFallback(inboxCandidates, 1, 1, initialEmailCounts)
 			if emailContent != nil {
+				log.Printf("[Cookie刷新] [%s] ✅ 获取到验证码邮件 provider=%s", email, providerUsed)
 				break
 			}
 			time.Sleep(2 * time.Second)

@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>business2api 管理面板</title>
+    <link rel="stylesheet" href="/admin/panel/assets/panel.css" />
+  </head>
+  <body>
+    <div class="bg-layer"></div>
+    <main class="page">
+      <header class="topbar panel">
+        <div class="brand">
+          <h1>business2api 管理台</h1>
+          <p>账号管理 / 文件导入导出 / 失效清理 / 流式验证</p>
+        </div>
+        <div class="auth-box">
+          <label for="apiKeyInput">API Key</label>
+          <div class="row">
+            <input id="apiKeyInput" type="password" placeholder="请输入 Bearer Token" />
+            <button id="saveKeyBtn" class="btn btn-primary">保存</button>
+          </div>
+          <div class="status-row">
+            <span id="serviceDot" class="dot dot-off"></span>
+            <span id="serviceText">未连接</span>
+          </div>
+        </div>
+      </header>
+
+      <section class="stats-grid">
+        <article class="panel stat-card">
+          <h3>Ready</h3>
+          <strong id="statReady">-</strong>
+        </article>
+        <article class="panel stat-card">
+          <h3>Pending</h3>
+          <strong id="statPending">-</strong>
+        </article>
+        <article class="panel stat-card">
+          <h3>Pending External</h3>
+          <strong id="statPendingExternal">-</strong>
+        </article>
+        <article class="panel stat-card stat-warning">
+          <h3>Invalid</h3>
+          <strong id="statInvalid">-</strong>
+        </article>
+        <article class="panel stat-card stat-highlight">
+          <h3>Available Today</h3>
+          <strong id="statAvailableToday">-</strong>
+        </article>
+      </section>
+
+      <section class="panel action-panel">
+        <h2>操作区</h2>
+        <div class="row wrap">
+          <button id="reloadPoolBtn" class="btn btn-primary">刷新号池</button>
+          <div class="row group">
+            <input id="registerCountInput" type="number" min="1" max="20" value="1" />
+            <button id="triggerRegisterBtn" class="btn">触发注册（Python）</button>
+          </div>
+          <button id="refreshAllBtn" class="btn">刷新全部数据</button>
+        </div>
+        <pre id="actionLog" class="log-box" aria-live="polite"></pre>
+      </section>
+
+      <section class="panel section-panel">
+        <div class="section-head">
+          <h2>账号列表</h2>
+          <div class="row wrap">
+            <select id="accountStateFilter">
+              <option value="all">全部</option>
+              <option value="active">激活</option>
+              <option value="invalid">失效</option>
+            </select>
+            <input id="accountStatusFilter" type="text" placeholder="状态过滤（逗号分隔）" />
+            <input id="accountQFilter" type="text" placeholder="邮箱关键字" />
+            <button id="applyAccountFilterBtn" class="btn">筛选</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>邮箱</th>
+                <th>状态</th>
+                <th>是否有效</th>
+                <th>失效原因</th>
+                <th>失败次数</th>
+                <th>剩余额度</th>
+                <th>最后使用</th>
+              </tr>
+            </thead>
+            <tbody id="accountsBody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="accountsPrevBtn" class="btn btn-sm">上一页</button>
+          <span id="accountsPageInfo">-</span>
+          <button id="accountsNextBtn" class="btn btn-sm">下一页</button>
+        </div>
+      </section>
+
+      <section class="panel section-panel">
+        <div class="section-head">
+          <h2>号池文件</h2>
+          <div class="row wrap">
+            <select id="fileStateFilter">
+              <option value="all">全部</option>
+              <option value="active">激活</option>
+              <option value="invalid">失效</option>
+            </select>
+            <input id="fileStatusFilter" type="text" placeholder="状态过滤（逗号分隔）" />
+            <input id="fileQFilter" type="text" placeholder="文件名/邮箱关键字" />
+            <button id="applyFileFilterBtn" class="btn">筛选</button>
+          </div>
+        </div>
+
+        <div class="row wrap action-row">
+          <button id="exportZipBtn" class="btn btn-primary">导出 ZIP</button>
+          <label class="upload-btn">
+            <input id="importFileInput" type="file" accept=".zip,.json" />
+            导入 ZIP/JSON
+          </label>
+          <button id="previewDeleteBtn" class="btn btn-danger-outline">预览失效删除</button>
+          <button id="executeDeleteBtn" class="btn btn-danger">确认删除</button>
+        </div>
+        <pre id="fileActionLog" class="log-box" aria-live="polite"></pre>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>文件名</th>
+                <th>邮箱(文件名)</th>
+                <th>解析</th>
+                <th>状态</th>
+                <th>在池中</th>
+                <th>configId</th>
+                <th>csesidx</th>
+                <th>大小</th>
+                <th>修改时间</th>
+              </tr>
+            </thead>
+            <tbody id="filesBody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="filesPrevBtn" class="btn btn-sm">上一页</button>
+          <span id="filesPageInfo">-</span>
+          <button id="filesNextBtn" class="btn btn-sm">下一页</button>
+        </div>
+      </section>
+
+      <section class="panel section-panel">
+        <div class="section-head">
+          <h2>模型列表</h2>
+          <button id="refreshModelsBtn" class="btn btn-sm">刷新模型</button>
+        </div>
+        <pre id="modelsOutput" class="log-box"></pre>
+      </section>
+
+      <section class="panel section-panel">
+        <h2>调用测试（流式/非流式）</h2>
+        <div class="row wrap">
+          <select id="chatModelSelect"></select>
+          <label class="checkbox">
+            <input id="streamSwitch" type="checkbox" />
+            流式 SSE
+          </label>
+          <button id="sendChatBtn" class="btn btn-primary">发送测试请求</button>
+          <button id="saveTemplateBtn" class="btn">保存模板</button>
+        </div>
+        <textarea id="chatPromptInput" rows="5" placeholder="输入测试提示词"></textarea>
+        <div id="chatMeta" class="meta-line">等待请求...</div>
+        <pre id="chatOutput" class="log-box stream-box"></pre>
+      </section>
+    </main>
+
+    <script src="/admin/panel/assets/panel.js" defer></script>
+  </body>
+</html>

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +16,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,19 +41,24 @@ import (
 
 // ==================== 配置结构 ====================
 type PoolConfig struct {
-	TargetCount            int  `json:"target_count"`              // 目标账号数量
-	MinCount               int  `json:"min_count"`                 // 最小账号数，低于此值触发注册
-	CheckIntervalMinutes   int  `json:"check_interval_minutes"`    // 检查间隔(分钟)
-	RegisterThreads        int  `json:"register_threads"`          // 注册线程数
-	RegisterHeadless       bool `json:"register_headless"`         // 无头模式
-	RefreshOnStartup       bool `json:"refresh_on_startup"`        // 启动时刷新账号
-	RefreshCooldownSec     int  `json:"refresh_cooldown_sec"`      // 刷新冷却时间(秒)
-	UseCooldownSec         int  `json:"use_cooldown_sec"`          // 使用冷却时间(秒)
-	MaxFailCount           int  `json:"max_fail_count"`            // 最大连续失败次数
-	EnableBrowserRefresh   bool `json:"enable_browser_refresh"`    // 启用浏览器刷新401账号
-	BrowserRefreshHeadless bool `json:"browser_refresh_headless"`  // 浏览器刷新无头模式
-	BrowserRefreshMaxRetry int  `json:"browser_refresh_max_retry"` // 浏览器刷新最大重试次数(0=禁用)
-	AutoDelete401          bool `json:"auto_delete_401"`           // 401时自动删除账号
+	TargetCount            int      `json:"target_count"`              // 目标账号数量
+	MinCount               int      `json:"min_count"`                 // 最小账号数，低于此值触发注册
+	CheckIntervalMinutes   int      `json:"check_interval_minutes"`    // 检查间隔(分钟)
+	EnableGoRegister       bool     `json:"enable_go_register"`        // 启用 Go 内置注册
+	RegisterThreads        int      `json:"register_threads"`          // 注册线程数
+	RegisterHeadless       bool     `json:"register_headless"`         // 无头模式
+	MailChannelOrder       []string `json:"mail_channel_order"`        // 邮箱渠道优先级
+	DuckMailBearer         string   `json:"duckmail_bearer"`           // DuckMail Bearer
+	RefreshOnStartup       bool     `json:"refresh_on_startup"`        // 启动时刷新账号
+	RefreshCooldownSec     int      `json:"refresh_cooldown_sec"`      // 刷新冷却时间(秒)
+	UseCooldownSec         int      `json:"use_cooldown_sec"`          // 使用冷却时间(秒)
+	MaxFailCount           int      `json:"max_fail_count"`            // 最大连续失败次数
+	EnableBrowserRefresh   bool     `json:"enable_browser_refresh"`    // 启用浏览器刷新401账号
+	BrowserRefreshHeadless bool     `json:"browser_refresh_headless"`  // 浏览器刷新无头模式
+	BrowserRefreshMaxRetry int      `json:"browser_refresh_max_retry"` // 浏览器刷新最大重试次数(0=禁用)
+	AutoDelete401          bool     `json:"auto_delete_401"`           // 401时自动删除账号
+	ExternalRefreshMode    bool     `json:"external_refresh_mode"`     // 启用外部续期模式
+	RegistrarBaseURL       string   `json:"registrar_base_url"`        // Python registrar 地址
 }
 
 // FlowConfig Flow 服务配置
@@ -479,6 +487,54 @@ func max(a, b int64) int64 {
 	return b
 }
 
+func normalizeMailChannelOrder(order []string) []string {
+	if len(order) == 0 {
+		return []string{"chatgpt"}
+	}
+
+	seen := make(map[string]bool)
+	var normalized []string
+	for _, item := range order {
+		ch := strings.ToLower(strings.TrimSpace(item))
+		if ch != "duckmail" && ch != "chatgpt" {
+			continue
+		}
+		if seen[ch] {
+			continue
+		}
+		seen[ch] = true
+		normalized = append(normalized, ch)
+	}
+	if len(normalized) == 0 {
+		return []string{"chatgpt"}
+	}
+	return normalized
+}
+
+func getPoolBoolFieldFromJSON(data []byte, field string) (bool, bool) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false, false
+	}
+	poolRaw, ok := root["pool"]
+	if !ok {
+		return false, false
+	}
+	var poolMap map[string]json.RawMessage
+	if err := json.Unmarshal(poolRaw, &poolMap); err != nil {
+		return false, false
+	}
+	valueRaw, ok := poolMap[field]
+	if !ok {
+		return false, false
+	}
+	var value bool
+	if err := json.Unmarshal(valueRaw, &value); err != nil {
+		return true, false
+	}
+	return true, value
+}
+
 var appConfig = AppConfig{
 	ListenAddr: ":8000",
 	DataDir:    "./data",
@@ -486,8 +542,10 @@ var appConfig = AppConfig{
 		TargetCount:            50,
 		MinCount:               10,
 		CheckIntervalMinutes:   30,
+		EnableGoRegister:       true,
 		RegisterThreads:        1,
 		RegisterHeadless:       false,
+		MailChannelOrder:       []string{"chatgpt"},
 		RefreshOnStartup:       true,
 		RefreshCooldownSec:     240, // 4分钟
 		UseCooldownSec:         15,  // 15秒
@@ -495,6 +553,8 @@ var appConfig = AppConfig{
 		EnableBrowserRefresh:   true, // 默认启用浏览器刷新
 		BrowserRefreshHeadless: false,
 		BrowserRefreshMaxRetry: 1, // 浏览器刷新最多重试1次
+		ExternalRefreshMode:    false,
+		RegistrarBaseURL:       "http://127.0.0.1:8090",
 	},
 }
 
@@ -523,6 +583,8 @@ func reloadConfig() error {
 	oldAPIKeys := appConfig.APIKeys
 	oldDebug := appConfig.Debug
 	oldPoolConfig := appConfig.Pool
+	hasEnableGoRegister, enableGoRegister := getPoolBoolFieldFromJSON(data, "enable_go_register")
+	hasExternalRefreshMode, externalRefreshMode := getPoolBoolFieldFromJSON(data, "external_refresh_mode")
 
 	// 更新可热重载的配置项
 	appConfig.APIKeys = newConfig.APIKeys
@@ -537,6 +599,22 @@ func reloadConfig() error {
 	appConfig.Pool.BrowserRefreshHeadless = newConfig.Pool.BrowserRefreshHeadless
 	appConfig.Pool.BrowserRefreshMaxRetry = newConfig.Pool.BrowserRefreshMaxRetry
 	appConfig.Pool.AutoDelete401 = newConfig.Pool.AutoDelete401
+	appConfig.Pool.EnableGoRegister = oldPoolConfig.EnableGoRegister
+	if hasEnableGoRegister {
+		appConfig.Pool.EnableGoRegister = enableGoRegister
+	}
+	appConfig.Pool.ExternalRefreshMode = oldPoolConfig.ExternalRefreshMode
+	if hasExternalRefreshMode {
+		appConfig.Pool.ExternalRefreshMode = externalRefreshMode
+	}
+	appConfig.Pool.MailChannelOrder = normalizeMailChannelOrder(newConfig.Pool.MailChannelOrder)
+	appConfig.Pool.DuckMailBearer = strings.TrimSpace(newConfig.Pool.DuckMailBearer)
+	if v := strings.TrimSpace(newConfig.Pool.RegistrarBaseURL); v != "" {
+		appConfig.Pool.RegistrarBaseURL = v
+	}
+	newConfig.Pool.EnableGoRegister = appConfig.Pool.EnableGoRegister
+	newConfig.Pool.ExternalRefreshMode = appConfig.Pool.ExternalRefreshMode
+	newConfig.Pool.RegistrarBaseURL = appConfig.Pool.RegistrarBaseURL
 	configMu.Unlock()
 
 	// 应用变更
@@ -576,6 +654,10 @@ func applyConfigChanges(oldAPIKeys []string, oldDebug bool, oldPoolConfig PoolCo
 		pool.BrowserRefreshMaxRetry = newConfig.Pool.BrowserRefreshMaxRetry
 	}
 	pool.AutoDelete401 = newConfig.Pool.AutoDelete401
+	pool.ExternalRefreshMode = newConfig.Pool.ExternalRefreshMode
+	register.MailChannelOrder = normalizeMailChannelOrder(newConfig.Pool.MailChannelOrder)
+	register.DuckMailBearer = strings.TrimSpace(newConfig.Pool.DuckMailBearer)
+	register.EnableGoRegister = newConfig.Pool.EnableGoRegister
 
 	logger.Info("✅ 配置热重载完成")
 }
@@ -691,6 +773,15 @@ func mergeConfig(base, loaded *AppConfig) {
 	if loaded.Pool.RegisterThreads > 0 {
 		base.Pool.RegisterThreads = loaded.Pool.RegisterThreads
 	}
+	if len(loaded.Pool.MailChannelOrder) > 0 {
+		base.Pool.MailChannelOrder = normalizeMailChannelOrder(loaded.Pool.MailChannelOrder)
+	}
+	if strings.TrimSpace(loaded.Pool.DuckMailBearer) != "" {
+		base.Pool.DuckMailBearer = strings.TrimSpace(loaded.Pool.DuckMailBearer)
+	}
+	if strings.TrimSpace(loaded.Pool.RegistrarBaseURL) != "" {
+		base.Pool.RegistrarBaseURL = strings.TrimSpace(loaded.Pool.RegistrarBaseURL)
+	}
 	// bool 字段直接覆盖
 	base.Pool.RegisterHeadless = loaded.Pool.RegisterHeadless
 	base.Pool.RefreshOnStartup = loaded.Pool.RefreshOnStartup
@@ -761,6 +852,14 @@ func loadAppConfig() {
 		} else {
 			// 合并配置：配置文件中有的字段覆盖默认值，没有的保留默认值
 			mergeConfig(&appConfig, &loadedConfig)
+			if hasEnableGoRegister, enableGoRegister := getPoolBoolFieldFromJSON(data, "enable_go_register"); hasEnableGoRegister {
+				appConfig.Pool.EnableGoRegister = enableGoRegister
+			} else {
+				appConfig.Pool.EnableGoRegister = true
+			}
+			if hasExternalRefreshMode, externalRefreshMode := getPoolBoolFieldFromJSON(data, "external_refresh_mode"); hasExternalRefreshMode {
+				appConfig.Pool.ExternalRefreshMode = externalRefreshMode
+			}
 			logger.Info("✅ 加载配置文件: %s", configPath)
 		}
 	} else if os.IsNotExist(err) {
@@ -806,6 +905,7 @@ func loadAppConfig() {
 		pool.BrowserRefreshMaxRetry = appConfig.Pool.BrowserRefreshMaxRetry
 	}
 	pool.AutoDelete401 = appConfig.Pool.AutoDelete401
+	pool.ExternalRefreshMode = appConfig.Pool.ExternalRefreshMode
 	// 服务端模式下，如果 expired_action 是 delete，则同步设置 AutoDelete401
 	if appConfig.PoolServer.Enable && appConfig.PoolServer.Mode == "server" && appConfig.PoolServer.ExpiredAction == "delete" {
 		pool.AutoDelete401 = true
@@ -821,6 +921,9 @@ func loadAppConfig() {
 	register.Threads = appConfig.Pool.RegisterThreads
 	register.Headless = appConfig.Pool.RegisterHeadless
 	register.Proxy = Proxy
+	register.EnableGoRegister = appConfig.Pool.EnableGoRegister
+	register.MailChannelOrder = normalizeMailChannelOrder(appConfig.Pool.MailChannelOrder)
+	register.DuckMailBearer = strings.TrimSpace(appConfig.Pool.DuckMailBearer)
 
 	// 初始化代理池
 	initProxyPool()
@@ -1082,7 +1185,7 @@ func getCommonHeaders(jwt, origAuth string) map[string]string {
 		"sec-fetch-site":     "cross-site",
 	}
 	// 同时携带原始 authorization
-	if origAuth != "" {
+	if origAuth != "" && !strings.HasPrefix(strings.ToLower(origAuth), "bearer fallback-csesidx-") {
 		headers["x-original-authorization"] = origAuth
 	}
 	return headers
@@ -3331,6 +3434,8 @@ func runAsClient() {
 			Success:       result.Success,
 			Email:         result.Email,
 			FullName:      result.FullName,
+			MailProvider:  result.MailProvider,
+			MailPassword:  result.MailPassword,
 			SecureCookies: result.Cookies,
 			Authorization: result.Authorization,
 			ConfigID:      result.ConfigID,
@@ -3425,6 +3530,994 @@ func runAPIServer() {
 	}
 }
 
+const (
+	defaultRegistrarBaseURL = "http://127.0.0.1:8090"
+	maxListPageSize         = 200
+	defaultListPageSize     = 20
+)
+
+type adminAccountView struct {
+	Email          string    `json:"email"`
+	EmailMasked    string    `json:"email_masked"`
+	Status         string    `json:"status"`
+	IsValid        bool      `json:"is_valid"`
+	InvalidReason  string    `json:"invalid_reason,omitempty"`
+	FailCount      int       `json:"fail_count"`
+	LastUsed       time.Time `json:"last_used,omitempty"`
+	LastRefresh    time.Time `json:"last_refresh,omitempty"`
+	DailyCount     int       `json:"daily_count"`
+	DailyLimit     int       `json:"daily_limit"`
+	DailyRemaining int       `json:"daily_remaining"`
+	SuccessCount   int       `json:"success_count"`
+	TotalCount     int       `json:"total_count"`
+	JWTExpires     time.Time `json:"jwt_expires,omitempty"`
+}
+
+type adminPoolFileView struct {
+	FileName          string    `json:"file_name"`
+	EmailFromFilename string    `json:"email_from_filename"`
+	ParseOK           bool      `json:"parse_ok"`
+	ParseError        string    `json:"parse_error,omitempty"`
+	ExistsInPool      bool      `json:"exists_in_pool"`
+	PoolStatus        string    `json:"pool_status"`
+	HasConfigID       bool      `json:"has_config_id"`
+	HasCSESIDX        bool      `json:"has_csesidx"`
+	SizeBytes         int64     `json:"size_bytes"`
+	ModifiedAt        time.Time `json:"modified_at"`
+}
+
+type adminPoolFileRecord struct {
+	view          adminPoolFileView
+	filePath      string
+	accountEmail  string
+	invalidReason string
+}
+
+type adminDeleteCandidate struct {
+	FileName     string    `json:"file_name"`
+	Email        string    `json:"email"`
+	Reason       string    `json:"reason"`
+	SizeBytes    int64     `json:"size_bytes"`
+	ModifiedAt   time.Time `json:"modified_at"`
+	Status       string    `json:"status"`
+	EmailMasked  string    `json:"email_masked"`
+	ParseError   string    `json:"parse_error,omitempty"`
+	ExistsInPool bool      `json:"exists_in_pool"`
+	ScopeMatched bool      `json:"scope_matched"`
+}
+
+type adminImportResult struct {
+	Total          int      `json:"total"`
+	Success        int      `json:"success"`
+	Failed         int      `json:"failed"`
+	Skipped        int      `json:"skipped"`
+	Errors         []string `json:"errors"`
+	ImportedEmails []string `json:"imported_emails"`
+}
+
+type adminDeleteExecuteRequest struct {
+	Files      []string `json:"files"`
+	AutoBackup *bool    `json:"auto_backup"`
+}
+
+func getRegistrarBaseURL() string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	if v := strings.TrimSpace(appConfig.Pool.RegistrarBaseURL); v != "" {
+		return v
+	}
+	return defaultRegistrarBaseURL
+}
+
+func normalizeStateFilter(raw string) string {
+	state := strings.ToLower(strings.TrimSpace(raw))
+	switch state {
+	case "", "all":
+		return "all"
+	case "active":
+		return "active"
+	case "invalid":
+		return "invalid"
+	default:
+		return "all"
+	}
+}
+
+func parseStatusFilter(raw string) map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		status := pool.NormalizeStatus(item)
+		if status == "" {
+			continue
+		}
+		result[status] = struct{}{}
+	}
+	return result
+}
+
+func containsStatus(filter map[string]struct{}, status string) bool {
+	if len(filter) == 0 {
+		return true
+	}
+	_, ok := filter[pool.NormalizeStatus(status)]
+	return ok
+}
+
+func containsIgnoreCase(haystack, needle string) bool {
+	if strings.TrimSpace(needle) == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(haystack), strings.ToLower(strings.TrimSpace(needle)))
+}
+
+func matchState(status, state string) bool {
+	switch state {
+	case "active":
+		return pool.IsActiveStatus(status)
+	case "invalid":
+		return !pool.IsActiveStatus(status)
+	default:
+		return true
+	}
+}
+
+func parsePageParams(c *gin.Context) (int, int) {
+	page := 1
+	pageSize := defaultListPageSize
+	if v := strings.TrimSpace(c.Query("page")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if v := strings.TrimSpace(c.Query("page_size")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			pageSize = parsed
+		}
+	}
+	if pageSize > maxListPageSize {
+		pageSize = maxListPageSize
+	}
+	return page, pageSize
+}
+
+func maskEmail(email string) string {
+	email = strings.TrimSpace(email)
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		if len(email) <= 3 {
+			return "***"
+		}
+		return email[:1] + "***" + email[len(email)-1:]
+	}
+	local := parts[0]
+	domain := parts[1]
+	if len(local) <= 2 {
+		local = local[:1] + "***"
+	} else {
+		local = local[:1] + "***" + local[len(local)-1:]
+	}
+	return local + "@" + domain
+}
+
+func statusOrder(status string) int {
+	switch pool.NormalizeStatus(status) {
+	case "ready":
+		return 1
+	case "pending":
+		return 2
+	case "cooldown":
+		return 3
+	case "pending_external":
+		return 4
+	case "invalid":
+		return 5
+	default:
+		return 6
+	}
+}
+
+func getPoolAccountIndex() map[string]pool.AccountInfo {
+	result := make(map[string]pool.AccountInfo)
+	for _, info := range pool.Pool.ListAccounts() {
+		email := strings.ToLower(strings.TrimSpace(info.Email))
+		if email == "" {
+			continue
+		}
+		result[email] = info
+	}
+	return result
+}
+
+func collectPoolFileRecords(dataDir string) ([]adminPoolFileRecord, error) {
+	files, err := filepath.Glob(filepath.Join(dataDir, "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+
+	accountIndex := getPoolAccountIndex()
+	records := make([]adminPoolFileRecord, 0, len(files))
+	for _, path := range files {
+		baseName := filepath.Base(path)
+		emailFromFilename := strings.TrimSuffix(baseName, filepath.Ext(baseName))
+		record := adminPoolFileRecord{
+			filePath:     path,
+			accountEmail: emailFromFilename,
+			view: adminPoolFileView{
+				FileName:          baseName,
+				EmailFromFilename: emailFromFilename,
+				PoolStatus:        "invalid",
+			},
+		}
+
+		stat, statErr := os.Stat(path)
+		if statErr != nil {
+			record.view.ParseError = fmt.Sprintf("读取文件元数据失败: %v", statErr)
+			record.invalidReason = "stat_failed"
+			records = append(records, record)
+			continue
+		}
+		record.view.SizeBytes = stat.Size()
+		record.view.ModifiedAt = stat.ModTime()
+
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			record.view.ParseError = fmt.Sprintf("读取文件失败: %v", readErr)
+			record.invalidReason = "read_failed"
+			records = append(records, record)
+			continue
+		}
+
+		var accData pool.AccountData
+		if err := json.Unmarshal(raw, &accData); err != nil {
+			record.view.ParseError = fmt.Sprintf("JSON 解析失败: %v", err)
+			record.invalidReason = "json_parse_error"
+			records = append(records, record)
+			continue
+		}
+
+		record.view.ParseOK = true
+		accEmail := strings.TrimSpace(accData.Email)
+		if accEmail != "" {
+			record.accountEmail = accEmail
+		}
+		record.view.HasConfigID = strings.TrimSpace(accData.ConfigID) != ""
+		record.view.HasCSESIDX = strings.TrimSpace(accData.CSESIDX) != ""
+
+		valid, reason := pool.ValidateAccountData(&accData)
+		if !valid {
+			record.invalidReason = reason
+			record.view.ParseError = reason
+		}
+
+		if info, ok := accountIndex[strings.ToLower(record.accountEmail)]; ok {
+			record.view.ExistsInPool = true
+			record.view.PoolStatus = pool.NormalizeStatus(info.Status)
+		} else if valid {
+			record.view.PoolStatus = "unknown"
+		} else {
+			record.view.PoolStatus = "invalid"
+		}
+
+		records = append(records, record)
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		if statusOrder(records[i].view.PoolStatus) == statusOrder(records[j].view.PoolStatus) {
+			return strings.ToLower(records[i].view.FileName) < strings.ToLower(records[j].view.FileName)
+		}
+		return statusOrder(records[i].view.PoolStatus) < statusOrder(records[j].view.PoolStatus)
+	})
+	return records, nil
+}
+
+func buildAdminAccountViews(dataDir string) ([]adminAccountView, error) {
+	accountIndex := getPoolAccountIndex()
+	fileRecords, err := collectPoolFileRecords(dataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	views := make([]adminAccountView, 0, len(fileRecords)+len(accountIndex))
+	seen := make(map[string]struct{})
+	for _, rec := range fileRecords {
+		email := strings.TrimSpace(rec.accountEmail)
+		if email == "" {
+			email = rec.view.EmailFromFilename
+		}
+		status := pool.NormalizeStatus(rec.view.PoolStatus)
+		if status == "" {
+			status = "invalid"
+		}
+
+		view := adminAccountView{
+			Email:       email,
+			EmailMasked: maskEmail(email),
+			Status:      status,
+			IsValid:     rec.view.ParseOK && rec.invalidReason == "" && pool.IsActiveStatus(status),
+		}
+
+		if rec.view.ParseError != "" {
+			view.InvalidReason = rec.view.ParseError
+		}
+		if view.InvalidReason == "" && !pool.IsActiveStatus(status) {
+			view.InvalidReason = "status_not_active"
+		}
+
+		if info, ok := accountIndex[strings.ToLower(email)]; ok {
+			view.FailCount = info.FailCount
+			view.LastUsed = info.LastUsed
+			view.LastRefresh = info.LastRefresh
+			view.DailyCount = info.DailyCount
+			view.DailyLimit = info.DailyLimit
+			view.DailyRemaining = info.DailyRemaining
+			view.SuccessCount = info.SuccessCount
+			view.TotalCount = info.TotalCount
+			view.JWTExpires = info.JWTExpires
+			view.Status = pool.NormalizeStatus(info.Status)
+			view.IsValid = rec.invalidReason == "" && pool.IsActiveStatus(view.Status)
+			if rec.invalidReason == "" && !pool.IsActiveStatus(view.Status) {
+				view.InvalidReason = "status_not_active"
+			}
+			delete(accountIndex, strings.ToLower(email))
+		}
+
+		views = append(views, view)
+		seen[strings.ToLower(email)] = struct{}{}
+	}
+
+	for _, info := range accountIndex {
+		email := strings.TrimSpace(info.Email)
+		if email == "" {
+			continue
+		}
+		if _, ok := seen[strings.ToLower(email)]; ok {
+			continue
+		}
+		status := pool.NormalizeStatus(info.Status)
+		view := adminAccountView{
+			Email:          email,
+			EmailMasked:    maskEmail(email),
+			Status:         status,
+			IsValid:        pool.IsActiveStatus(status),
+			FailCount:      info.FailCount,
+			LastUsed:       info.LastUsed,
+			LastRefresh:    info.LastRefresh,
+			DailyCount:     info.DailyCount,
+			DailyLimit:     info.DailyLimit,
+			DailyRemaining: info.DailyRemaining,
+			SuccessCount:   info.SuccessCount,
+			TotalCount:     info.TotalCount,
+			JWTExpires:     info.JWTExpires,
+		}
+		if !view.IsValid {
+			view.InvalidReason = "status_not_active"
+		}
+		views = append(views, view)
+	}
+
+	sort.Slice(views, func(i, j int) bool {
+		if statusOrder(views[i].Status) == statusOrder(views[j].Status) {
+			return strings.ToLower(views[i].Email) < strings.ToLower(views[j].Email)
+		}
+		return statusOrder(views[i].Status) < statusOrder(views[j].Status)
+	})
+	return views, nil
+}
+
+func filterAccountViews(items []adminAccountView, state string, statusFilter map[string]struct{}, q string) []adminAccountView {
+	filtered := make([]adminAccountView, 0, len(items))
+	for _, item := range items {
+		if !matchState(item.Status, state) {
+			continue
+		}
+		if !containsStatus(statusFilter, item.Status) {
+			continue
+		}
+		if !containsIgnoreCase(item.Email, q) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func filterPoolFileRecords(items []adminPoolFileRecord, state string, statusFilter map[string]struct{}, q string) []adminPoolFileRecord {
+	filtered := make([]adminPoolFileRecord, 0, len(items))
+	for _, item := range items {
+		status := pool.NormalizeStatus(item.view.PoolStatus)
+		if !matchState(status, state) {
+			continue
+		}
+		if !containsStatus(statusFilter, status) {
+			continue
+		}
+		if !containsIgnoreCase(item.view.FileName, q) && !containsIgnoreCase(item.accountEmail, q) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func paginatePoolFileViews(items []adminPoolFileView, page, pageSize int) ([]adminPoolFileView, int) {
+	total := len(items)
+	if total == 0 {
+		return []adminPoolFileView{}, 0
+	}
+	start := (page - 1) * pageSize
+	if start >= total {
+		return []adminPoolFileView{}, total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return items[start:end], total
+}
+
+func isStructureInvalid(record adminPoolFileRecord) bool {
+	if record.invalidReason == "" {
+		return false
+	}
+	return record.invalidReason != "status_not_active"
+}
+
+func buildDeleteInvalidCandidates(records []adminPoolFileRecord, scope string) []adminDeleteCandidate {
+	candidates := make([]adminDeleteCandidate, 0)
+	for _, record := range records {
+		reason := ""
+		scopeMatched := false
+
+		if isStructureInvalid(record) {
+			reason = record.invalidReason
+			scopeMatched = true
+		} else if pool.NormalizeStatus(record.view.PoolStatus) == "invalid" {
+			reason = "status_invalid"
+			scopeMatched = true
+		}
+
+		if scope == "invalid_files_and_invalid_accounts" && !scopeMatched {
+			continue
+		}
+
+		email := strings.TrimSpace(record.accountEmail)
+		if email == "" {
+			email = record.view.EmailFromFilename
+		}
+
+		candidates = append(candidates, adminDeleteCandidate{
+			FileName:     record.view.FileName,
+			Email:        email,
+			Reason:       reason,
+			SizeBytes:    record.view.SizeBytes,
+			ModifiedAt:   record.view.ModifiedAt,
+			Status:       record.view.PoolStatus,
+			EmailMasked:  maskEmail(email),
+			ParseError:   record.view.ParseError,
+			ExistsInPool: record.view.ExistsInPool,
+			ScopeMatched: scopeMatched,
+		})
+	}
+	return candidates
+}
+
+func createBackupZip(dataDir string, filePaths []string) (string, error) {
+	backupName := fmt.Sprintf("invalid-backup-%s.zip", time.Now().Format("20060102-150405"))
+	backupPath := filepath.Join(dataDir, backupName)
+	outFile, err := os.Create(backupPath)
+	if err != nil {
+		return "", err
+	}
+	zipWriter := zip.NewWriter(outFile)
+
+	writeErr := func(err error) (string, error) {
+		_ = zipWriter.Close()
+		_ = outFile.Close()
+		_ = os.Remove(backupPath)
+		return "", err
+	}
+
+	for _, path := range filePaths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return writeErr(fmt.Errorf("读取备份文件失败 %s: %w", filepath.Base(path), err))
+		}
+		entry, err := zipWriter.Create(filepath.Base(path))
+		if err != nil {
+			return writeErr(fmt.Errorf("写入备份 ZIP 失败 %s: %w", filepath.Base(path), err))
+		}
+		if _, err := entry.Write(raw); err != nil {
+			return writeErr(fmt.Errorf("写入备份内容失败 %s: %w", filepath.Base(path), err))
+		}
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		return writeErr(fmt.Errorf("关闭备份 ZIP 失败: %w", err))
+	}
+	if err := outFile.Close(); err != nil {
+		return "", fmt.Errorf("关闭备份文件失败: %w", err)
+	}
+	return backupPath, nil
+}
+
+func importSingleAccountPayload(name string, payload []byte, overwrite bool, result *adminImportResult) {
+	result.Total++
+	var accData pool.AccountData
+	if err := json.Unmarshal(payload, &accData); err != nil {
+		result.Failed++
+		result.Errors = append(result.Errors, fmt.Sprintf("%s: JSON 解析失败: %v", name, err))
+		return
+	}
+
+	accData.Email = strings.TrimSpace(accData.Email)
+	cookies := accData.Cookies
+	if len(cookies) == 0 && strings.TrimSpace(accData.CookieString) != "" {
+		cookies = pool.ParseCookieString(accData.CookieString)
+	}
+	accData.Cookies = cookies
+
+	if valid, reason := pool.ValidateAccountData(&accData); !valid {
+		result.Failed++
+		result.Errors = append(result.Errors, fmt.Sprintf("%s: 校验失败: %s", name, reason))
+		return
+	}
+
+	filePath := filepath.Join(DataDir, fmt.Sprintf("%s.json", accData.Email))
+	if !overwrite {
+		if _, err := os.Stat(filePath); err == nil {
+			result.Skipped++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: 邮箱 %s 已存在，跳过", name, accData.Email))
+			return
+		}
+	}
+
+	req := &pool.AccountUploadRequest{
+		Email:         accData.Email,
+		FullName:      accData.FullName,
+		MailProvider:  accData.MailProvider,
+		MailPassword:  accData.MailPassword,
+		Cookies:       cookies,
+		CookieString:  accData.CookieString,
+		Authorization: accData.Authorization,
+		ConfigID:      accData.ConfigID,
+		CSESIDX:       accData.CSESIDX,
+		IsNew:         false,
+	}
+	if err := pool.ProcessAccountUpload(pool.Pool, DataDir, req); err != nil {
+		result.Failed++
+		result.Errors = append(result.Errors, fmt.Sprintf("%s: 写入失败: %v", name, err))
+		return
+	}
+	result.Success++
+	result.ImportedEmails = append(result.ImportedEmails, accData.Email)
+}
+
+func handlePoolFilesImport(c *gin.Context) {
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(400, gin.H{"error": "缺少上传文件字段 file"})
+		return
+	}
+
+	overwrite := true
+	if raw := strings.TrimSpace(c.PostForm("overwrite")); raw != "" {
+		overwrite = strings.EqualFold(raw, "true") || raw == "1"
+	}
+
+	fileReader, err := fileHeader.Open()
+	if err != nil {
+		c.JSON(400, gin.H{"error": fmt.Sprintf("打开上传文件失败: %v", err)})
+		return
+	}
+	defer fileReader.Close()
+
+	payload, err := io.ReadAll(fileReader)
+	if err != nil {
+		c.JSON(400, gin.H{"error": fmt.Sprintf("读取上传文件失败: %v", err)})
+		return
+	}
+
+	result := &adminImportResult{
+		Errors:         make([]string, 0),
+		ImportedEmails: make([]string, 0),
+	}
+	lowerName := strings.ToLower(fileHeader.Filename)
+
+	switch {
+	case strings.HasSuffix(lowerName, ".json"):
+		importSingleAccountPayload(fileHeader.Filename, payload, overwrite, result)
+	case strings.HasSuffix(lowerName, ".zip"):
+		zipReader, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
+		if err != nil {
+			c.JSON(400, gin.H{"error": fmt.Sprintf("ZIP 解析失败: %v", err)})
+			return
+		}
+
+		foundJSON := false
+		for _, file := range zipReader.File {
+			if file.FileInfo().IsDir() {
+				continue
+			}
+			if !strings.HasSuffix(strings.ToLower(file.Name), ".json") {
+				continue
+			}
+			foundJSON = true
+			entry, err := file.Open()
+			if err != nil {
+				result.Total++
+				result.Failed++
+				result.Errors = append(result.Errors, fmt.Sprintf("%s: 打开 ZIP 条目失败: %v", file.Name, err))
+				continue
+			}
+			entryPayload, readErr := io.ReadAll(entry)
+			_ = entry.Close()
+			if readErr != nil {
+				result.Total++
+				result.Failed++
+				result.Errors = append(result.Errors, fmt.Sprintf("%s: 读取 ZIP 条目失败: %v", file.Name, readErr))
+				continue
+			}
+			importSingleAccountPayload(file.Name, entryPayload, overwrite, result)
+		}
+		if !foundJSON {
+			c.JSON(400, gin.H{"error": "ZIP 内未找到 JSON 文件"})
+			return
+		}
+	default:
+		c.JSON(400, gin.H{"error": "仅支持 .zip 或 .json 文件"})
+		return
+	}
+
+	_ = pool.Pool.Load(DataDir)
+
+	c.JSON(200, gin.H{
+		"total":           result.Total,
+		"success":         result.Success,
+		"failed":          result.Failed,
+		"skipped":         result.Skipped,
+		"errors":          result.Errors,
+		"imported_emails": result.ImportedEmails,
+		"overwrite":       overwrite,
+	})
+}
+
+func handleAdminPanel(c *gin.Context) {
+	panelPath := filepath.Join("web", "admin", "index.html")
+	if _, err := os.Stat(panelPath); err != nil {
+		c.JSON(404, gin.H{"error": "admin panel not found"})
+		return
+	}
+	c.File(panelPath)
+}
+
+func handleAdminPanelAsset(c *gin.Context) {
+	assetPath := strings.TrimPrefix(c.Param("filepath"), "/")
+	assetPath = filepath.Clean(assetPath)
+	if assetPath == "." || strings.HasPrefix(assetPath, "..") {
+		c.JSON(400, gin.H{"error": "invalid asset path"})
+		return
+	}
+	fullPath := filepath.Join("web", "admin", assetPath)
+	base := filepath.Clean(filepath.Join("web", "admin"))
+	cleanFullPath := filepath.Clean(fullPath)
+	if !strings.HasPrefix(cleanFullPath, base+string(os.PathSeparator)) && cleanFullPath != base {
+		c.JSON(400, gin.H{"error": "invalid asset path"})
+		return
+	}
+	if _, err := os.Stat(cleanFullPath); err != nil {
+		c.JSON(404, gin.H{"error": "asset not found"})
+		return
+	}
+	c.File(cleanFullPath)
+}
+
+func handleAdminAccounts(c *gin.Context) {
+	state := normalizeStateFilter(c.Query("state"))
+	statusFilter := parseStatusFilter(c.Query("status"))
+	q := strings.TrimSpace(c.Query("q"))
+
+	accounts, err := buildAdminAccountViews(DataDir)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("读取账号列表失败: %v", err)})
+		return
+	}
+	filtered := filterAccountViews(accounts, state, statusFilter, q)
+	c.JSON(200, gin.H{
+		"items":  filtered,
+		"total":  len(filtered),
+		"state":  state,
+		"status": c.Query("status"),
+		"q":      q,
+	})
+}
+
+func handleAdminPoolFiles(c *gin.Context) {
+	state := normalizeStateFilter(c.Query("state"))
+	statusFilter := parseStatusFilter(c.Query("status"))
+	q := strings.TrimSpace(c.Query("q"))
+	page, pageSize := parsePageParams(c)
+
+	records, err := collectPoolFileRecords(DataDir)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("读取号池文件失败: %v", err)})
+		return
+	}
+	filteredRecords := filterPoolFileRecords(records, state, statusFilter, q)
+	items := make([]adminPoolFileView, 0, len(filteredRecords))
+	for _, rec := range filteredRecords {
+		items = append(items, rec.view)
+	}
+	pageItems, total := paginatePoolFileViews(items, page, pageSize)
+
+	c.JSON(200, gin.H{
+		"items":      pageItems,
+		"total":      total,
+		"page":       page,
+		"page_size":  pageSize,
+		"state":      state,
+		"status":     c.Query("status"),
+		"q":          q,
+		"total_page": (total + pageSize - 1) / pageSize,
+	})
+}
+
+func handleAdminPoolFilesExport(c *gin.Context) {
+	state := normalizeStateFilter(c.Query("state"))
+	statusFilter := parseStatusFilter(c.Query("status"))
+	q := strings.TrimSpace(c.Query("q"))
+
+	records, err := collectPoolFileRecords(DataDir)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("读取号池文件失败: %v", err)})
+		return
+	}
+	filtered := filterPoolFileRecords(records, state, statusFilter, q)
+
+	buffer := bytes.NewBuffer(nil)
+	zipWriter := zip.NewWriter(buffer)
+
+	manifestFiles := make([]adminPoolFileView, 0, len(filtered))
+	exportErrors := make([]string, 0)
+	for _, record := range filtered {
+		manifestFiles = append(manifestFiles, record.view)
+		raw, readErr := os.ReadFile(record.filePath)
+		if readErr != nil {
+			exportErrors = append(exportErrors, fmt.Sprintf("%s: %v", record.view.FileName, readErr))
+			continue
+		}
+		entry, err := zipWriter.Create(record.view.FileName)
+		if err != nil {
+			exportErrors = append(exportErrors, fmt.Sprintf("%s: %v", record.view.FileName, err))
+			continue
+		}
+		if _, err := entry.Write(raw); err != nil {
+			exportErrors = append(exportErrors, fmt.Sprintf("%s: %v", record.view.FileName, err))
+			continue
+		}
+	}
+
+	manifest := map[string]interface{}{
+		"generated_at":   time.Now().UTC().Format(time.RFC3339),
+		"state":          state,
+		"status":         c.Query("status"),
+		"q":              q,
+		"total":          len(filtered),
+		"exported_count": len(filtered) - len(exportErrors),
+		"errors":         exportErrors,
+		"files":          manifestFiles,
+	}
+	manifestRaw, _ := json.MarshalIndent(manifest, "", "  ")
+	manifestEntry, err := zipWriter.Create("manifest.json")
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("创建 manifest 失败: %v", err)})
+		return
+	}
+	if _, err := manifestEntry.Write(manifestRaw); err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("写入 manifest 失败: %v", err)})
+		return
+	}
+	if err := zipWriter.Close(); err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("导出 ZIP 失败: %v", err)})
+		return
+	}
+
+	filename := fmt.Sprintf("pool-export-%s.zip", time.Now().Format("20060102-150405"))
+	c.Header("Content-Type", "application/zip")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	c.Header("X-Export-Count", strconv.Itoa(len(filtered)))
+	c.Header("X-Export-Errors", strconv.Itoa(len(exportErrors)))
+	c.Data(200, "application/zip", buffer.Bytes())
+}
+
+func handleDeleteInvalidPreview(c *gin.Context) {
+	scope := strings.TrimSpace(c.DefaultQuery("scope", "invalid_files_and_invalid_accounts"))
+	if scope == "" {
+		scope = "invalid_files_and_invalid_accounts"
+	}
+
+	records, err := collectPoolFileRecords(DataDir)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("读取号池文件失败: %v", err)})
+		return
+	}
+	candidates := buildDeleteInvalidCandidates(records, scope)
+
+	structureInvalid := 0
+	statusInvalid := 0
+	for _, c := range candidates {
+		if c.Reason == "status_invalid" {
+			statusInvalid++
+		} else {
+			structureInvalid++
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"scope":      scope,
+		"candidates": candidates,
+		"total":      len(candidates),
+		"summary": gin.H{
+			"structure_invalid": structureInvalid,
+			"status_invalid":    statusInvalid,
+		},
+	})
+}
+
+func handleDeleteInvalidExecute(c *gin.Context) {
+	var req adminDeleteExecuteRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if len(req.Files) == 0 {
+		c.JSON(400, gin.H{"error": "files 不能为空"})
+		return
+	}
+	autoBackup := true
+	if req.AutoBackup != nil {
+		autoBackup = *req.AutoBackup
+	}
+
+	records, err := collectPoolFileRecords(DataDir)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("读取号池文件失败: %v", err)})
+		return
+	}
+	allowed := make(map[string]adminPoolFileRecord)
+	for _, record := range buildDeleteInvalidCandidates(records, "invalid_files_and_invalid_accounts") {
+		allowed[record.FileName] = adminPoolFileRecord{
+			filePath: filepath.Join(DataDir, record.FileName),
+		}
+	}
+
+	uniqueFiles := make([]string, 0, len(req.Files))
+	seen := make(map[string]struct{})
+	for _, file := range req.Files {
+		name := filepath.Base(strings.TrimSpace(file))
+		if name == "" || name != strings.TrimSpace(file) {
+			continue
+		}
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		if _, ok := allowed[name]; !ok {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		uniqueFiles = append(uniqueFiles, name)
+	}
+	if len(uniqueFiles) == 0 {
+		c.JSON(400, gin.H{"error": "未提供可删除文件（需来自 preview 结果）"})
+		return
+	}
+
+	pathsToDelete := make([]string, 0, len(uniqueFiles))
+	for _, name := range uniqueFiles {
+		pathsToDelete = append(pathsToDelete, filepath.Join(DataDir, name))
+	}
+
+	backupFile := ""
+	if autoBackup {
+		if created, err := createBackupZip(DataDir, pathsToDelete); err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("创建备份失败: %v", err)})
+			return
+		} else {
+			backupFile = created
+		}
+	}
+
+	deletedFiles := make([]string, 0, len(pathsToDelete))
+	failed := make([]string, 0)
+	for i, path := range pathsToDelete {
+		if err := os.Remove(path); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", uniqueFiles[i], err))
+			continue
+		}
+		deletedFiles = append(deletedFiles, uniqueFiles[i])
+	}
+
+	_ = pool.Pool.Load(DataDir)
+
+	resp := gin.H{
+		"deleted_count": len(deletedFiles),
+		"deleted_files": deletedFiles,
+		"failed":        failed,
+		"stats":         pool.Pool.Stats(),
+	}
+	if backupFile != "" {
+		resp["backup_file"] = backupFile
+	}
+	c.JSON(200, resp)
+}
+
+func handleRegistrarTriggerRegister(c *gin.Context) {
+	var req struct {
+		Count int `json:"count"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Count < 1 {
+		req.Count = 1
+	}
+	if req.Count > 20 {
+		req.Count = 20
+	}
+
+	baseURL := strings.TrimRight(getRegistrarBaseURL(), "/")
+	targetURL := fmt.Sprintf("%s/trigger/register?count=%d", baseURL, req.Count)
+
+	httpReq, err := http.NewRequest(http.MethodPost, targetURL, nil)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("构建 registrar 请求失败: %v", err)})
+		return
+	}
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		c.JSON(502, gin.H{
+			"error":         fmt.Sprintf("调用 registrar 失败: %v", err),
+			"registrar_url": targetURL,
+			"source":        "python_registrar",
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.JSON(resp.StatusCode, gin.H{
+			"error":            "registrar 返回错误",
+			"registrar_url":    targetURL,
+			"registrar_status": resp.StatusCode,
+			"registrar_body":   string(body),
+			"source":           "python_registrar",
+		})
+		return
+	}
+
+	var passthrough interface{}
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &passthrough)
+	}
+
+	response := gin.H{
+		"accepted":      true,
+		"count":         req.Count,
+		"source":        "python_registrar",
+		"registrar_url": targetURL,
+	}
+	if passthrough != nil {
+		response["registrar_response"] = passthrough
+	}
+	c.JSON(200, response)
+}
+
 func setupAPIRoutes(r *gin.Engine) {
 	// 请求日志中间件
 	r.Use(func(c *gin.Context) {
@@ -3497,6 +4590,10 @@ func setupAPIRoutes(r *gin.Engine) {
 			"mode":    map[PoolMode]string{PoolModeLocal: "local", PoolModeServer: "server", PoolModeClient: "client"}[poolMode],
 		})
 	})
+
+	// 管理面板静态资源（页面本身不鉴权，具体管理接口仍由 API Key 保护）
+	r.GET("/admin/panel", handleAdminPanel)
+	r.GET("/admin/panel/assets/*filepath", handleAdminPanelAsset)
 
 	// WebSocket 端点（服务端模式下用于客户端连接）
 	r.GET("/ws", func(c *gin.Context) {
@@ -3624,6 +4721,10 @@ func setupAPIRoutes(r *gin.Engine) {
 	admin := r.Group("/admin")
 	admin.Use(apiKeyAuth())
 	admin.POST("/register", func(c *gin.Context) {
+		if poolMode == PoolModeLocal && !register.EnableGoRegister {
+			c.JSON(400, gin.H{"error": "Go 注册已禁用，请使用 Python registrar 接管"})
+			return
+		}
 		var req struct {
 			Count int `json:"count"`
 		}
@@ -3646,6 +4747,46 @@ func setupAPIRoutes(r *gin.Engine) {
 		c.JSON(200, gin.H{"message": "注册已启动", "target": req.Count})
 	})
 
+	admin.POST("/registrar/upload-account", func(c *gin.Context) {
+		var req pool.AccountUploadRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		if err := pool.ProcessAccountUpload(pool.Pool, DataDir, &req); err != nil {
+			statusCode := 500
+			if errors.Is(err, pool.ErrInvalidAccountUpload) {
+				statusCode = 400
+			}
+			c.JSON(statusCode, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"success": true,
+			"message": fmt.Sprintf("账号 %s 已入池", req.Email),
+		})
+	})
+
+	admin.GET("/registrar/refresh-tasks", func(c *gin.Context) {
+		limit := 20
+		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+		if limit > 200 {
+			limit = 200
+		}
+
+		tasks := pool.Pool.ExternalRefreshTasks(limit)
+		c.JSON(200, gin.H{
+			"tasks": tasks,
+			"count": len(tasks),
+		})
+	})
+
 	admin.POST("/refresh", func(c *gin.Context) {
 		pool.Pool.Load(DataDir)
 		c.JSON(200, gin.H{
@@ -3654,6 +4795,14 @@ func setupAPIRoutes(r *gin.Engine) {
 			"pending": pool.Pool.PendingCount(),
 		})
 	})
+
+	admin.GET("/accounts", handleAdminAccounts)
+	admin.GET("/pool-files", handleAdminPoolFiles)
+	admin.GET("/pool-files/export", handleAdminPoolFilesExport)
+	admin.POST("/pool-files/import", handlePoolFilesImport)
+	admin.POST("/pool-files/delete-invalid/preview", handleDeleteInvalidPreview)
+	admin.POST("/pool-files/delete-invalid/execute", handleDeleteInvalidExecute)
+	admin.POST("/registrar/trigger-register", handleRegistrarTriggerRegister)
 
 	admin.GET("/status", func(c *gin.Context) {
 		stats := pool.Pool.Stats()
@@ -3701,6 +4850,7 @@ func setupAPIRoutes(r *gin.Engine) {
 				"browser_refresh_headless":  appConfig.Pool.BrowserRefreshHeadless,
 				"browser_refresh_max_retry": appConfig.Pool.BrowserRefreshMaxRetry,
 				"auto_delete_401":           appConfig.Pool.AutoDelete401,
+				"registrar_base_url":        appConfig.Pool.RegistrarBaseURL,
 			},
 		})
 		configMu.RUnlock()
@@ -3930,12 +5080,14 @@ func runLocalMode() {
 	if appConfig.Pool.RefreshOnStartup {
 		pool.Pool.StartPoolManager()
 	}
-	if pool.Pool.TotalCount() == 0 {
+	if pool.Pool.TotalCount() == 0 && register.EnableGoRegister {
 		needCount := appConfig.Pool.TargetCount
 		logger.Info("📝 无账号，启动注册 %d 个...", needCount)
 		register.StartRegister(needCount)
+	} else if pool.Pool.TotalCount() == 0 {
+		logger.Info("🧩 Go 注册已禁用，等待外部 registrar 注入账号")
 	}
-	if appConfig.Pool.CheckIntervalMinutes > 0 {
+	if appConfig.Pool.CheckIntervalMinutes > 0 && register.EnableGoRegister {
 		go register.PoolMaintainer()
 	}
 

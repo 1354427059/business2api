@@ -8,15 +8,20 @@
     "target_count": 50,
     "min_count": 10,
     "check_interval_minutes": 30,
+    "enable_go_register": true,
     "register_threads": 1,
     "register_headless": true,
+    "mail_channel_order": ["chatgpt"],
+    "duckmail_bearer": "",
     "refresh_on_startup": true,
     "refresh_cooldown_sec": 240,
     "use_cooldown_sec": 15,
     "max_fail_count": 3,
     "enable_browser_refresh": true,
     "browser_refresh_headless": true,
-    "browser_refresh_max_retry": 1
+    "browser_refresh_max_retry": 1,
+    "external_refresh_mode": false,
+    "registrar_base_url": "http://127.0.0.1:8090"
   },
   "pool_server": {
     "enable": false,

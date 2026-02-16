@@ -19,6 +19,8 @@ type BrowserRegisterResult struct {
 	Success       bool
 	Email         string
 	FullName      string
+	MailProvider  string
+	MailPassword  string
 	SecureCookies []Cookie
 	Authorization string
 	ConfigID      string
@@ -421,6 +423,12 @@ func (pc *PoolClient) handleRefreshTask(data map[string]interface{}) {
 	if auth, ok := data["authorization"].(string); ok {
 		acc.Data.Authorization = auth
 	}
+	if provider, ok := data["mail_provider"].(string); ok {
+		acc.Data.MailProvider = provider
+	}
+	if password, ok := data["mail_password"].(string); ok {
+		acc.Data.MailPassword = password
+	}
 	if configID, ok := data["config_id"].(string); ok {
 		acc.ConfigID = configID
 	}
@@ -462,6 +470,8 @@ func (pc *PoolClient) handleRefreshTask(data map[string]interface{}) {
 		// 上传更新后的账号数据到服务器
 		uploadReq := &AccountUploadRequest{
 			Email:         email,
+			MailProvider:  acc.Data.MailProvider,
+			MailPassword:  acc.Data.MailPassword,
 			Cookies:       result.SecureCookies,
 			Authorization: authorization,
 			ConfigID:      configID,
@@ -511,6 +521,8 @@ func (pc *PoolClient) uploadAccount(result *BrowserRegisterResult, isNew bool) e
 	req := &AccountUploadRequest{
 		Email:         result.Email,
 		FullName:      result.FullName,
+		MailProvider:  result.MailProvider,
+		MailPassword:  result.MailPassword,
 		Cookies:       result.SecureCookies,
 		CookieString:  cookieStr,
 		Authorization: result.Authorization,

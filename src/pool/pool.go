@@ -31,6 +31,8 @@ type Cookie struct {
 type AccountData struct {
 	Email           string            `json:"email"`
 	FullName        string            `json:"fullName"`
+	MailProvider    string            `json:"mail_provider,omitempty"`
+	MailPassword    string            `json:"mail_password,omitempty"`
 	Authorization   string            `json:"authorization"`
 	Cookies         []Cookie          `json:"cookies"`
 	CookieString    string            `json:"cookie_string,omitempty"`
@@ -64,6 +66,20 @@ func ParseCookieString(cookieStr string) []Cookie {
 	return cookies
 }
 
+func BuildCookieString(cookies []Cookie) string {
+	if len(cookies) == 0 {
+		return ""
+	}
+	var cookieParts []string
+	for _, c := range cookies {
+		if strings.TrimSpace(c.Name) == "" {
+			continue
+		}
+		cookieParts = append(cookieParts, fmt.Sprintf("%s=%s", c.Name, c.Value))
+	}
+	return strings.Join(cookieParts, "; ")
+}
+
 func (a *AccountData) GetAllCookies() []Cookie {
 	if len(a.Cookies) > 0 {
 		return a.Cookies
@@ -74,14 +90,64 @@ func (a *AccountData) GetAllCookies() []Cookie {
 	return nil
 }
 
+var activeStatuses = map[string]struct{}{
+	"ready":            {},
+	"pending":          {},
+	"cooldown":         {},
+	"pending_external": {},
+}
+
+// NormalizeStatus 统一状态值格式
+func NormalizeStatus(status string) string {
+	return strings.ToLower(strings.TrimSpace(status))
+}
+
+// IsActiveStatus 判断状态是否属于激活账号
+func IsActiveStatus(status string) bool {
+	_, ok := activeStatuses[NormalizeStatus(status)]
+	return ok
+}
+
+// ValidateAccountData 校验账号结构是否可用
+func ValidateAccountData(data *AccountData) (bool, string) {
+	if data == nil {
+		return false, "empty account data"
+	}
+
+	if strings.TrimSpace(data.Email) == "" {
+		return false, "missing email"
+	}
+
+	cookies := data.Cookies
+	if len(cookies) == 0 && strings.TrimSpace(data.CookieString) != "" {
+		cookies = ParseCookieString(data.CookieString)
+	}
+	if len(cookies) == 0 {
+		return false, "missing cookies"
+	}
+
+	if strings.TrimSpace(data.Authorization) == "" {
+		return false, "missing authorization"
+	}
+	if strings.TrimSpace(data.ConfigID) == "" {
+		return false, "missing configId"
+	}
+	if strings.TrimSpace(data.CSESIDX) == "" {
+		return false, "missing csesidx"
+	}
+
+	return true, ""
+}
+
 // AccountStatus 账号状态
 type AccountStatus int
 
 const (
-	StatusPending  AccountStatus = iota // 待刷新
-	StatusReady                         // 就绪可用
-	StatusCooldown                      // 冷却中
-	StatusInvalid                       // 失效
+	StatusPending         AccountStatus = iota // 待刷新
+	StatusReady                                // 就绪可用
+	StatusCooldown                             // 冷却中
+	StatusInvalid                              // 失效
+	StatusPendingExternal                      // 待外部续期
 )
 
 // Account 账号实例
@@ -122,6 +188,7 @@ var (
 	BrowserRefreshHeadless = true             // 浏览器刷新是否无头模式
 	BrowserRefreshMaxRetry = 1                // 浏览器刷新最大重试次数
 	AutoDelete401          = false            // 401时是否自动删除账号
+	ExternalRefreshMode    = false            // 是否启用外部续期模式
 	DailyLimit             = 3000             // 每账号每日最大调用次数
 	DataDir                string
 	DefaultConfig          string
@@ -283,6 +350,7 @@ func (p *AccountPool) Load(dir string) error {
 			CSESIDX:   csesidx,
 			ConfigID:  configID,
 			Refreshed: false,
+			Status:    StatusPending,
 		})
 	}
 
@@ -300,16 +368,27 @@ func (p *AccountPool) GetPendingAccount() *Account {
 		return nil
 	}
 
-	acc := p.pendingAccounts[0]
-	p.pendingAccounts = p.pendingAccounts[1:]
-	return acc
+	for i, acc := range p.pendingAccounts {
+		acc.Mu.Lock()
+		status := acc.Status
+		acc.Mu.Unlock()
+		if status == StatusPendingExternal {
+			continue
+		}
+		p.pendingAccounts = append(p.pendingAccounts[:i], p.pendingAccounts[i+1:]...)
+		return acc
+	}
+	return nil
 }
 
 // MarkReady 标记账号为就绪
 func (p *AccountPool) MarkReady(acc *Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	acc.Mu.Lock()
 	acc.Refreshed = true
+	acc.Status = StatusReady
+	acc.Mu.Unlock()
 	p.readyAccounts = append(p.readyAccounts, acc)
 }
 
@@ -327,10 +406,44 @@ func (p *AccountPool) MarkPending(acc *Account) {
 
 	acc.Mu.Lock()
 	acc.Refreshed = false
+	acc.Status = StatusPending
 	acc.Mu.Unlock()
 
 	p.pendingAccounts = append(p.pendingAccounts, acc)
 	log.Printf("🔄 账号 %s 移至刷新池", filepath.Base(acc.FilePath))
+}
+
+// MarkExternalRefreshPending 标记账号待外部续期
+func (p *AccountPool) MarkExternalRefreshPending(acc *Account) {
+	if acc == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i, a := range p.readyAccounts {
+		if a == acc {
+			p.readyAccounts = append(p.readyAccounts[:i], p.readyAccounts[i+1:]...)
+			break
+		}
+	}
+
+	// 避免重复入队
+	for i := len(p.pendingAccounts) - 1; i >= 0; i-- {
+		if p.pendingAccounts[i] == acc {
+			p.pendingAccounts = append(p.pendingAccounts[:i], p.pendingAccounts[i+1:]...)
+		}
+	}
+
+	acc.Mu.Lock()
+	acc.Refreshed = false
+	acc.LastRefresh = time.Time{}
+	acc.Status = StatusPendingExternal
+	acc.Mu.Unlock()
+
+	p.pendingAccounts = append(p.pendingAccounts, acc)
+	log.Printf("🧩 账号 %s 标记为待外部续期", filepath.Base(acc.FilePath))
 }
 
 // RemoveAccount 删除失效账号
@@ -351,11 +464,7 @@ func (acc *Account) SaveToFile() error {
 
 	// 同时生成 cookie 字符串（方便调试和兼容老版本）
 	if len(acc.Data.Cookies) > 0 {
-		var cookieParts []string
-		for _, c := range acc.Data.Cookies {
-			cookieParts = append(cookieParts, fmt.Sprintf("%s=%s", c.Name, c.Value))
-		}
-		acc.Data.CookieString = strings.Join(cookieParts, "; ")
+		acc.Data.CookieString = BuildCookieString(acc.Data.Cookies)
 	}
 
 	data, err := json.MarshalIndent(acc.Data, "", "  ")
@@ -410,6 +519,12 @@ func (p *AccountPool) refreshWorker(id int) {
 				strings.Contains(errMsg, "401") ||
 				strings.Contains(errMsg, "403") {
 				log.Printf("⚠️ [worker-%d] [%s] 认证失效: %v", id, acc.Data.Email, err)
+
+				// 外部续期模式：不走 Go 浏览器刷新/自动删除，转为外部任务
+				if ExternalRefreshMode {
+					p.MarkExternalRefreshPending(acc)
+					continue
+				}
 
 				// 如果配置了401自动删除，直接删除账号
 				if AutoDelete401 {
@@ -582,6 +697,7 @@ func (p *AccountPool) RefreshExpiredAccounts() {
 		if needsRefresh && !inCooldown {
 			acc.Mu.Lock()
 			acc.Refreshed = false
+			acc.Status = StatusPending
 			acc.Mu.Unlock()
 			p.pendingAccounts = append(p.pendingAccounts, acc)
 			refreshed++
@@ -609,8 +725,11 @@ func (p *AccountPool) RefreshAllAccounts() {
 			skipped++
 			continue
 		}
+		acc.Mu.Lock()
 		acc.Refreshed = false
 		acc.JWTExpires = time.Time{}
+		acc.Status = StatusPending
+		acc.Mu.Unlock()
 		p.pendingAccounts = append(p.pendingAccounts, acc)
 		refreshed++
 	}
@@ -745,10 +864,59 @@ func (p *AccountPool) MarkNeedsRefresh(acc *Account) {
 	if acc == nil {
 		return
 	}
+	if ExternalRefreshMode {
+		p.MarkExternalRefreshPending(acc)
+		return
+	}
 	acc.Mu.Lock()
 	acc.LastRefresh = time.Time{} // 重置刷新时间，强制刷新
 	acc.Mu.Unlock()
 	p.MarkPending(acc)
+}
+
+// ExternalRefreshTasks 获取待外部续期的任务列表
+func (p *AccountPool) ExternalRefreshTasks(limit int) []AccountUploadRequest {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	tasks := make([]AccountUploadRequest, 0, limit)
+	for _, acc := range p.pendingAccounts {
+		acc.Mu.Lock()
+		status := acc.Status
+		if status != StatusPendingExternal {
+			acc.Mu.Unlock()
+			continue
+		}
+
+		cookieString := strings.TrimSpace(acc.Data.CookieString)
+		if cookieString == "" {
+			cookieString = BuildCookieString(acc.Data.Cookies)
+		}
+
+		task := AccountUploadRequest{
+			Email:         acc.Data.Email,
+			FullName:      acc.Data.FullName,
+			MailProvider:  acc.Data.MailProvider,
+			MailPassword:  acc.Data.MailPassword,
+			Cookies:       append([]Cookie(nil), acc.Data.Cookies...),
+			CookieString:  cookieString,
+			Authorization: acc.Data.Authorization,
+			ConfigID:      acc.Data.ConfigID,
+			CSESIDX:       acc.Data.CSESIDX,
+			IsNew:         false,
+		}
+		acc.Mu.Unlock()
+
+		tasks = append(tasks, task)
+		if len(tasks) >= limit {
+			break
+		}
+	}
+	return tasks
 }
 
 func (p *AccountPool) Count() int { p.mu.RLock(); defer p.mu.RUnlock(); return len(p.readyAccounts) }
@@ -786,6 +954,7 @@ func (p *AccountPool) Stats() map[string]interface{} {
 	today := time.Now().Format("2006-01-02")
 	availableToday := 0
 	exceededToday := 0
+	pendingExternal := 0
 	for _, acc := range p.readyAccounts {
 		acc.Mu.Lock()
 		dailyCount := acc.DailyCount
@@ -799,18 +968,26 @@ func (p *AccountPool) Stats() map[string]interface{} {
 			exceededToday++
 		}
 	}
+	for _, acc := range p.pendingAccounts {
+		acc.Mu.Lock()
+		if acc.Status == StatusPendingExternal {
+			pendingExternal++
+		}
+		acc.Mu.Unlock()
+	}
 
 	return map[string]interface{}{
-		"ready":           len(p.readyAccounts),
-		"pending":         len(p.pendingAccounts),
-		"total":           len(p.readyAccounts) + len(p.pendingAccounts),
-		"available_today": availableToday,
-		"exceeded_today":  exceededToday,
-		"total_requests":  totalRequests,
-		"total_success":   totalSuccess,
-		"total_failed":    totalFailed,
-		"success_rate":    fmt.Sprintf("%.1f%%", successRate),
-		"daily_limit":     DailyLimit,
+		"ready":            len(p.readyAccounts),
+		"pending":          len(p.pendingAccounts),
+		"pending_external": pendingExternal,
+		"total":            len(p.readyAccounts) + len(p.pendingAccounts),
+		"available_today":  availableToday,
+		"exceeded_today":   exceededToday,
+		"total_requests":   totalRequests,
+		"total_success":    totalSuccess,
+		"total_failed":     totalFailed,
+		"success_rate":     fmt.Sprintf("%.1f%%", successRate),
+		"daily_limit":      DailyLimit,
 		"cooldowns": map[string]interface{}{
 			"refresh_sec": int(RefreshCooldown.Seconds()),
 			"use_sec":     int(UseCooldown.Seconds()),
@@ -840,10 +1017,11 @@ func (p *AccountPool) ListAccounts() []AccountInfo {
 
 	var accounts []AccountInfo
 	statusNames := map[AccountStatus]string{
-		StatusPending:  "pending",
-		StatusReady:    "ready",
-		StatusCooldown: "cooldown",
-		StatusInvalid:  "invalid",
+		StatusPending:         "pending",
+		StatusReady:           "ready",
+		StatusCooldown:        "cooldown",
+		StatusInvalid:         "invalid",
+		StatusPendingExternal: "pending_external",
 	}
 
 	today := time.Now().Format("2006-01-02")
@@ -895,6 +1073,7 @@ func (p *AccountPool) ForceRefreshAll() int {
 		acc.Refreshed = false
 		acc.JWTExpires = time.Time{}
 		acc.LastRefresh = time.Time{} // 强制跳过冷却
+		acc.Status = StatusPending
 		acc.Mu.Unlock()
 		p.pendingAccounts = append(p.pendingAccounts, acc)
 		count++

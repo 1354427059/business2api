@@ -3,11 +3,13 @@ package pool
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -364,6 +366,8 @@ func (ps *PoolServer) taskDispatcher() {
 				"email":         acc.Data.Email,
 				"cookies":       acc.Data.Cookies,
 				"authorization": acc.Data.Authorization,
+				"mail_provider": acc.Data.MailProvider,
+				"mail_password": acc.Data.MailPassword,
 				"config_id":     acc.ConfigID,
 				"csesidx":       acc.CSESIDX,
 			})
@@ -483,6 +487,8 @@ func (ps *PoolServer) assignTask(client *WSClient) {
 					"email":         acc.Data.Email,
 					"cookies":       acc.Data.Cookies,
 					"authorization": acc.Data.Authorization,
+					"mail_provider": acc.Data.MailProvider,
+					"mail_password": acc.Data.MailPassword,
 					"config_id":     acc.ConfigID,
 					"csesidx":       acc.CSESIDX,
 				},
@@ -1258,12 +1264,170 @@ func (rc *RemotePoolClient) RefreshJWT(email string) (*CachedAccount, error) {
 type AccountUploadRequest struct {
 	Email         string   `json:"email"`
 	FullName      string   `json:"full_name"`
+	MailProvider  string   `json:"mail_provider,omitempty"`
+	MailPassword  string   `json:"mail_password,omitempty"`
 	Cookies       []Cookie `json:"cookies"`
 	CookieString  string   `json:"cookie_string"`
 	Authorization string   `json:"authorization"`
 	ConfigID      string   `json:"config_id"`
 	CSESIDX       string   `json:"csesidx"`
 	IsNew         bool     `json:"is_new"`
+}
+
+var ErrInvalidAccountUpload = errors.New("invalid account upload request")
+
+func normalizeAndValidateUploadRequest(req *AccountUploadRequest) error {
+	if req == nil {
+		return fmt.Errorf("%w: 请求体不能为空", ErrInvalidAccountUpload)
+	}
+
+	req.Email = strings.TrimSpace(req.Email)
+	req.FullName = strings.TrimSpace(req.FullName)
+	req.MailProvider = strings.TrimSpace(req.MailProvider)
+	req.MailPassword = strings.TrimSpace(req.MailPassword)
+	req.Authorization = strings.TrimSpace(req.Authorization)
+	req.ConfigID = strings.TrimSpace(req.ConfigID)
+	req.CSESIDX = strings.TrimSpace(req.CSESIDX)
+	req.CookieString = strings.TrimSpace(req.CookieString)
+
+	if req.Email == "" {
+		return fmt.Errorf("%w: email 不能为空", ErrInvalidAccountUpload)
+	}
+	if req.IsNew && req.FullName == "" {
+		return fmt.Errorf("%w: full_name 不能为空（注册场景）", ErrInvalidAccountUpload)
+	}
+	if len(req.Cookies) == 0 {
+		return fmt.Errorf("%w: cookies 不能为空", ErrInvalidAccountUpload)
+	}
+	if req.Authorization == "" {
+		return fmt.Errorf("%w: authorization 不能为空", ErrInvalidAccountUpload)
+	}
+	if req.ConfigID == "" {
+		return fmt.Errorf("%w: config_id 不能为空", ErrInvalidAccountUpload)
+	}
+	if req.CSESIDX == "" {
+		return fmt.Errorf("%w: csesidx 不能为空", ErrInvalidAccountUpload)
+	}
+	return nil
+}
+
+func ProcessAccountUpload(accountPool *AccountPool, dataDir string, req *AccountUploadRequest) error {
+	if err := normalizeAndValidateUploadRequest(req); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(dataDir) == "" {
+		dataDir = "./data"
+	}
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("创建数据目录失败: %w", err)
+	}
+
+	filename := fmt.Sprintf("%s.json", req.Email)
+	filePath := filepath.Join(dataDir, filename)
+
+	// 续期场景允许空字段：保留旧值
+	if existingRaw, err := os.ReadFile(filePath); err == nil {
+		var existing AccountData
+		if json.Unmarshal(existingRaw, &existing) == nil {
+			if req.FullName == "" {
+				req.FullName = existing.FullName
+			}
+			if req.MailProvider == "" {
+				req.MailProvider = existing.MailProvider
+			}
+			if req.MailPassword == "" {
+				req.MailPassword = existing.MailPassword
+			}
+		}
+	}
+
+	if req.CookieString == "" {
+		req.CookieString = BuildCookieString(req.Cookies)
+	}
+
+	accData := AccountData{
+		Email:         req.Email,
+		FullName:      req.FullName,
+		MailProvider:  req.MailProvider,
+		MailPassword:  req.MailPassword,
+		Cookies:       req.Cookies,
+		CookieString:  req.CookieString,
+		Authorization: req.Authorization,
+		ConfigID:      req.ConfigID,
+		CSESIDX:       req.CSESIDX,
+		Timestamp:     time.Now().Format(time.RFC3339),
+	}
+
+	data, err := json.MarshalIndent(accData, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化账号数据失败: %w", err)
+	}
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return fmt.Errorf("保存账号文件失败: %w", err)
+	}
+
+	if accountPool == nil {
+		return nil
+	}
+
+	// 先加载文件确保账号存在
+	_ = accountPool.Load(dataDir)
+
+	accountPool.mu.Lock()
+	defer accountPool.mu.Unlock()
+
+	foundInPending := -1
+	for i, acc := range accountPool.pendingAccounts {
+		if acc.Data.Email == req.Email {
+			foundInPending = i
+			break
+		}
+	}
+
+	if foundInPending >= 0 {
+		acc := accountPool.pendingAccounts[foundInPending]
+		acc.Mu.Lock()
+		acc.Data = accData
+		acc.ConfigID = req.ConfigID
+		acc.CSESIDX = req.CSESIDX
+		acc.FailCount = 0
+		acc.BrowserRefreshCount = 0
+		acc.JWTExpires = time.Time{}
+		acc.Refreshed = false
+		acc.Status = StatusPending
+		acc.Mu.Unlock()
+		return nil
+	}
+
+	foundInReady := -1
+	for i, acc := range accountPool.readyAccounts {
+		if acc.Data.Email == req.Email {
+			foundInReady = i
+			break
+		}
+	}
+
+	if foundInReady >= 0 {
+		acc := accountPool.readyAccounts[foundInReady]
+		acc.Mu.Lock()
+		acc.Data = accData
+		acc.ConfigID = req.ConfigID
+		acc.CSESIDX = req.CSESIDX
+		acc.FailCount = 0
+		acc.BrowserRefreshCount = 0
+		acc.JWTExpires = time.Time{}
+		acc.Refreshed = false
+		acc.Status = StatusPending
+		acc.Mu.Unlock()
+
+		accountPool.readyAccounts = append(accountPool.readyAccounts[:foundInReady], accountPool.readyAccounts[foundInReady+1:]...)
+		accountPool.pendingAccounts = append(accountPool.pendingAccounts, acc)
+		return nil
+	}
+
+	logger.Warn("⚠️ [%s] 账号已保存但未在内存中找到", req.Email)
+	return nil
 }
 
 // handleUploadAccount 处理账号上传（客户端回传鉴权文件）
@@ -1283,62 +1447,15 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if req.Email == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "邮箱不能为空",
-		})
-		return
-	}
-
-	// 构建账号数据
-	accData := AccountData{
-		Email:         req.Email,
-		FullName:      req.FullName,
-		Cookies:       req.Cookies,
-		CookieString:  req.CookieString,
-		Authorization: req.Authorization,
-		ConfigID:      req.ConfigID,
-		CSESIDX:       req.CSESIDX,
-		Timestamp:     time.Now().Format(time.RFC3339),
-	}
-
-	// 保存到文件
 	dataDir := ps.config.DataDir
 	if dataDir == "" {
 		dataDir = "./data"
 	}
-
-	// 确保目录存在
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		logger.Error("创建数据目录失败: %v", err)
+	if err := ProcessAccountUpload(ps.pool, dataDir, &req); err != nil {
+		logger.Error("处理账号上传失败: %v", err)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
-			"error":   "服务器内部错误",
-		})
-		return
-	}
-
-	// 生成文件名
-	filename := fmt.Sprintf("%s.json", req.Email)
-	filePath := filepath.Join(dataDir, filename)
-
-	// 序列化并保存
-	data, err := json.MarshalIndent(accData, "", "  ")
-	if err != nil {
-		logger.Error("序列化账号数据失败: %v", err)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "序列化失败",
-		})
-		return
-	}
-
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		logger.Error("保存账号文件失败: %v", err)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "保存失败",
+			"error":   err.Error(),
 		})
 		return
 	}
@@ -1348,64 +1465,6 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 	} else {
 		logger.Info("✅ 收到账号续期数据: %s", req.Email)
 	}
-
-	// 先加载文件确保账号存在
-	ps.pool.Load(dataDir)
-
-	// 更新内存中的账号数据
-	ps.pool.mu.Lock()
-	found := false
-
-	// 查找并更新 pending 队列
-	for _, acc := range ps.pool.pendingAccounts {
-		if acc.Data.Email == req.Email {
-			acc.Mu.Lock()
-			acc.Data.Cookies = req.Cookies
-			acc.Data.CookieString = req.CookieString
-			acc.Data.Authorization = req.Authorization
-			acc.Data.ConfigID = req.ConfigID
-			acc.Data.CSESIDX = req.CSESIDX
-			acc.ConfigID = req.ConfigID
-			acc.CSESIDX = req.CSESIDX
-			acc.FailCount = 0
-			acc.BrowserRefreshCount = 0
-			acc.JWTExpires = time.Time{} // 重置JWT过期时间，让refreshWorker去刷新
-			acc.Mu.Unlock()
-			// 保留在 pending 队列，让 refreshWorker 去刷新 JWT
-			logger.Info("🔄 [%s] 账号已更新，等待JWT刷新", req.Email)
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		// 查找并更新 ready 队列
-		for _, acc := range ps.pool.readyAccounts {
-			if acc.Data.Email == req.Email {
-				acc.Mu.Lock()
-				acc.Data.Cookies = req.Cookies
-				acc.Data.CookieString = req.CookieString
-				acc.Data.Authorization = req.Authorization
-				acc.Data.ConfigID = req.ConfigID
-				acc.Data.CSESIDX = req.CSESIDX
-				acc.ConfigID = req.ConfigID
-				acc.CSESIDX = req.CSESIDX
-				acc.FailCount = 0
-				acc.BrowserRefreshCount = 0
-				acc.JWTExpires = time.Time{} // 重置JWT过期时间，下次使用时会触发刷新
-				acc.Mu.Unlock()
-				logger.Info("🔄 [%s] 账号已更新，下次使用时刷新JWT", req.Email)
-				found = true
-				break
-			}
-		}
-	}
-	ps.pool.mu.Unlock()
-
-	if !found {
-		logger.Warn("⚠️ [%s] 账号已保存但未在内存中找到", req.Email)
-	}
-
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"message": fmt.Sprintf("账号 %s 已保存", req.Email),
