@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -31,6 +32,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"business2api/src/adminauth"
+	"business2api/src/adminlogs"
 	"business2api/src/flow"
 	"business2api/src/logger"
 	"business2api/src/pool"
@@ -110,6 +113,11 @@ var (
 	flowClient       *flow.FlowClient
 	flowHandler      *flow.GenerationHandler
 	flowTokenPool    *flow.TokenPool
+	panelAuthStore   *adminauth.Store
+	panelSessions    *adminauth.SessionManager
+	logStreamHandler gin.HandlerFunc
+	panelAuthMu      sync.Mutex
+	panelAuthDataDir string
 )
 
 // 配置热重载相关
@@ -3183,45 +3191,92 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		statsVideos = videoCount
 	}
 }
+func extractAPIKey(c *gin.Context) string {
+	authHeader := c.GetHeader("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	}
+	return strings.TrimSpace(c.GetHeader("X-API-Key"))
+}
+
+func isValidAPIKey(apiKey string) bool {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return false
+	}
+	for _, key := range GetAPIKeys() {
+		if key == apiKey {
+			return true
+		}
+	}
+	return false
+}
+
+func isSessionAuthorized(c *gin.Context) bool {
+	if panelSessions == nil {
+		return false
+	}
+	token, err := c.Cookie(adminauth.SessionCookieName)
+	if err != nil || strings.TrimSpace(token) == "" {
+		return false
+	}
+	session, ok := panelSessions.Validate(token)
+	if !ok {
+		return false
+	}
+	c.Set("panel_username", session.Username)
+	c.Set("auth_type", "session")
+	return true
+}
+
 func apiKeyAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 使用线程安全的方式获取 API Keys
-		apiKeys := GetAPIKeys()
-		if len(apiKeys) == 0 {
+		if len(GetAPIKeys()) == 0 {
 			c.Next()
 			return
 		}
-		authHeader := c.GetHeader("Authorization")
-		apiKey := ""
 
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			apiKey = strings.TrimPrefix(authHeader, "Bearer ")
-		} else {
-			apiKey = c.GetHeader("X-API-Key")
-		}
-
+		apiKey := extractAPIKey(c)
 		if apiKey == "" {
 			c.JSON(401, gin.H{"error": "Missing API key"})
 			c.Abort()
 			return
 		}
-
-		// 验证 API Key
-		valid := false
-		for _, key := range apiKeys {
-			if key == apiKey {
-				valid = true
-				break
-			}
-		}
-
-		if !valid {
+		if !isValidAPIKey(apiKey) {
 			c.JSON(401, gin.H{"error": "Invalid API key"})
 			c.Abort()
 			return
 		}
-
+		c.Set("auth_type", "api_key")
+		c.Set("api_key", apiKey)
 		c.Next()
+	}
+}
+
+func adminAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isSessionAuthorized(c) {
+			c.Next()
+			return
+		}
+		if isValidAPIKey(extractAPIKey(c)) {
+			c.Set("auth_type", "api_key")
+			c.Next()
+			return
+		}
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		c.Abort()
+	}
+}
+
+func requireSessionAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isSessionAuthorized(c) {
+			c.Next()
+			return
+		}
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		c.Abort()
 	}
 }
 
@@ -3325,29 +3380,36 @@ func init() {
 	filterStdout()
 }
 func filterStdout() {
-	// 创建管道
+	// 创建 stdout 管道，用于统一过滤与日志聚合
 	r, w, err := os.Pipe()
 	if err != nil {
 		return
 	}
 	origStdout := os.Stdout
 	os.Stdout = w
+	log.SetOutput(w)
+
 	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := r.Read(buf)
-			if err != nil {
-				break
+		scanner := bufio.NewScanner(r)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
 			}
-			line := string(buf[:n])
-			// 过滤特定日志
+
+			// 过滤特定噪音日志
 			if strings.Contains(line, "REALITY localAddr:") ||
 				strings.Contains(line, "DialTLSContext") ||
 				strings.Contains(line, "sys_conn.go") ||
 				strings.Contains(line, "failed to sufficiently increase receive buffer size") {
-				continue // 丢弃
+				continue
 			}
-			origStdout.Write(buf[:n])
+
+			_, _ = origStdout.WriteString(line + "\n")
+			logger.AppendRaw("business2api", line)
 		}
 	}()
 }
@@ -3607,6 +3669,44 @@ func getRegistrarBaseURL() string {
 		return v
 	}
 	return defaultRegistrarBaseURL
+}
+
+func initPanelServices() error {
+	panelAuthMu.Lock()
+	defer panelAuthMu.Unlock()
+
+	if panelAuthStore != nil && panelSessions != nil && logStreamHandler != nil && panelAuthDataDir == DataDir {
+		return nil
+	}
+
+	store, err := adminauth.NewStore(DataDir)
+	if err != nil {
+		return fmt.Errorf("初始化管理员账号失败: %w", err)
+	}
+	panelAuthStore = store
+	panelSessions = adminauth.NewSessionManager(adminauth.DefaultSessionTTL)
+	logStreamHandler = adminlogs.NewStreamHandler(adminlogs.StreamHandlerConfig{
+		GetRegistrarBaseURL: getRegistrarBaseURL,
+		HTTPClient: &http.Client{
+			Timeout: 5 * time.Second,
+		},
+	}).Handler()
+	panelAuthDataDir = DataDir
+	return nil
+}
+
+func setSessionCookie(c *gin.Context, token string, expiresAt time.Time) {
+	maxAge := int(time.Until(expiresAt).Seconds())
+	if maxAge < 0 {
+		maxAge = 0
+	}
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(adminauth.SessionCookieName, token, maxAge, "/", "", false, true)
+}
+
+func clearSessionCookie(c *gin.Context) {
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(adminauth.SessionCookieName, "", -1, "/", "", false, true)
 }
 
 func normalizeStateFilter(raw string) string {
@@ -4182,6 +4282,124 @@ func handlePoolFilesImport(c *gin.Context) {
 	})
 }
 
+func handlePanelLogin(c *gin.Context) {
+	if panelAuthStore == nil || panelSessions == nil {
+		c.JSON(500, gin.H{"error": "panel auth unavailable"})
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	req.Username = strings.TrimSpace(req.Username)
+	req.Password = strings.TrimSpace(req.Password)
+	if req.Username == "" || req.Password == "" {
+		c.JSON(400, gin.H{"error": "用户名和密码不能为空"})
+		return
+	}
+
+	if !panelAuthStore.Verify(req.Username, req.Password) {
+		c.JSON(401, gin.H{"error": "用户名或密码错误"})
+		return
+	}
+
+	session, err := panelSessions.Create(req.Username)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("创建会话失败: %v", err)})
+		return
+	}
+
+	setSessionCookie(c, session.Token, session.ExpiresAt)
+	c.JSON(200, gin.H{
+		"success":    true,
+		"username":   session.Username,
+		"expires_at": session.ExpiresAt,
+	})
+}
+
+func handlePanelLogout(c *gin.Context) {
+	if panelSessions != nil {
+		if token, err := c.Cookie(adminauth.SessionCookieName); err == nil && strings.TrimSpace(token) != "" {
+			panelSessions.Delete(token)
+		}
+	}
+	clearSessionCookie(c)
+	c.JSON(200, gin.H{"success": true})
+}
+
+func handlePanelMe(c *gin.Context) {
+	if !isSessionAuthorized(c) {
+		c.JSON(200, gin.H{"authenticated": false})
+		return
+	}
+
+	username, _ := c.Get("panel_username")
+	token, _ := c.Cookie(adminauth.SessionCookieName)
+	session, ok := panelSessions.Validate(token)
+	if !ok {
+		c.JSON(200, gin.H{"authenticated": false})
+		return
+	}
+	c.JSON(200, gin.H{
+		"authenticated": true,
+		"username":      username,
+		"expires_at":    session.ExpiresAt,
+	})
+}
+
+func handlePanelChangePassword(c *gin.Context) {
+	if panelAuthStore == nil || panelSessions == nil {
+		c.JSON(500, gin.H{"error": "panel auth unavailable"})
+		return
+	}
+	authType, _ := c.Get("auth_type")
+	if authType != "session" {
+		c.JSON(403, gin.H{"error": "仅允许登录会话修改密码"})
+		return
+	}
+
+	var req struct {
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	req.NewPassword = strings.TrimSpace(req.NewPassword)
+	if len(req.NewPassword) < adminauth.MinPasswordLength {
+		c.JSON(400, gin.H{"error": fmt.Sprintf("新密码长度至少 %d 位", adminauth.MinPasswordLength)})
+		return
+	}
+
+	updatedAt, err := panelAuthStore.ChangePassword(req.NewPassword)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	username := panelAuthStore.Username()
+	panelSessions.DeleteByUsername(username)
+	clearSessionCookie(c)
+	c.JSON(200, gin.H{
+		"success":             true,
+		"username":            username,
+		"password_updated_at": updatedAt,
+	})
+}
+
+func handleLogsStream(c *gin.Context) {
+	if logStreamHandler == nil {
+		c.JSON(500, gin.H{"error": "log stream unavailable"})
+		return
+	}
+	logStreamHandler(c)
+}
+
 func handleAdminPanel(c *gin.Context) {
 	panelPath := filepath.Join("web", "admin", "index.html")
 	if _, err := os.Stat(panelPath); err != nil {
@@ -4519,6 +4737,10 @@ func handleRegistrarTriggerRegister(c *gin.Context) {
 }
 
 func setupAPIRoutes(r *gin.Engine) {
+	if err := initPanelServices(); err != nil {
+		panic(err)
+	}
+
 	// 请求日志中间件
 	r.Use(func(c *gin.Context) {
 		start := time.Now()
@@ -4594,6 +4816,11 @@ func setupAPIRoutes(r *gin.Engine) {
 	// 管理面板静态资源（页面本身不鉴权，具体管理接口仍由 API Key 保护）
 	r.GET("/admin/panel", handleAdminPanel)
 	r.GET("/admin/panel/assets/*filepath", handleAdminPanelAsset)
+	panelAuthGroup := r.Group("/admin/panel")
+	panelAuthGroup.POST("/login", handlePanelLogin)
+	panelAuthGroup.POST("/logout", handlePanelLogout)
+	panelAuthGroup.GET("/me", handlePanelMe)
+	panelAuthGroup.POST("/change-password", requireSessionAuth(), handlePanelChangePassword)
 
 	// WebSocket 端点（服务端模式下用于客户端连接）
 	r.GET("/ws", func(c *gin.Context) {
@@ -4719,7 +4946,7 @@ func setupAPIRoutes(r *gin.Engine) {
 	apiGroup.POST("/v1/models/*action", handleGeminiGenerate)
 
 	admin := r.Group("/admin")
-	admin.Use(apiKeyAuth())
+	admin.Use(adminAuth())
 	admin.POST("/register", func(c *gin.Context) {
 		if poolMode == PoolModeLocal && !register.EnableGoRegister {
 			c.JSON(400, gin.H{"error": "Go 注册已禁用，请使用 Python registrar 接管"})
@@ -4803,6 +5030,7 @@ func setupAPIRoutes(r *gin.Engine) {
 	admin.POST("/pool-files/delete-invalid/preview", handleDeleteInvalidPreview)
 	admin.POST("/pool-files/delete-invalid/execute", handleDeleteInvalidExecute)
 	admin.POST("/registrar/trigger-register", handleRegistrarTriggerRegister)
+	admin.GET("/logs/stream", handleLogsStream)
 
 	admin.GET("/status", func(c *gin.Context) {
 		stats := pool.Pool.Stats()

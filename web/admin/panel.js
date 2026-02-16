@@ -12,6 +12,19 @@
     fileTotalPage: 1,
     deletePreviewFiles: [],
     models: [],
+    activeTab: "console",
+    session: {
+      authenticated: false,
+      username: "",
+      expiresAt: "",
+    },
+    logStream: {
+      eventSource: null,
+      paused: false,
+      autoScroll: true,
+      source: "all",
+      level: "all",
+    },
   };
 
   const els = {
@@ -19,6 +32,21 @@
     saveKeyBtn: document.getElementById("saveKeyBtn"),
     serviceDot: document.getElementById("serviceDot"),
     serviceText: document.getElementById("serviceText"),
+    sessionInfo: document.getElementById("sessionInfo"),
+    openChangePwdBtn: document.getElementById("openChangePwdBtn"),
+    logoutBtn: document.getElementById("logoutBtn"),
+
+    loginSection: document.getElementById("loginSection"),
+    appSection: document.getElementById("appSection"),
+    loginUsername: document.getElementById("loginUsername"),
+    loginPassword: document.getElementById("loginPassword"),
+    loginBtn: document.getElementById("loginBtn"),
+    loginMessage: document.getElementById("loginMessage"),
+
+    tabBtnConsole: document.getElementById("tabBtnConsole"),
+    tabBtnLogs: document.getElementById("tabBtnLogs"),
+    tabConsole: document.getElementById("tabConsole"),
+    tabLogs: document.getElementById("tabLogs"),
 
     statReady: document.getElementById("statReady"),
     statPending: document.getElementById("statPending"),
@@ -64,17 +92,50 @@
     chatPromptInput: document.getElementById("chatPromptInput"),
     chatMeta: document.getElementById("chatMeta"),
     chatOutput: document.getElementById("chatOutput"),
+
+    logStreamStatus: document.getElementById("logStreamStatus"),
+    logSourceSelect: document.getElementById("logSourceSelect"),
+    logLevelSelect: document.getElementById("logLevelSelect"),
+    toggleLogStreamBtn: document.getElementById("toggleLogStreamBtn"),
+    clearLogViewBtn: document.getElementById("clearLogViewBtn"),
+    autoScrollSwitch: document.getElementById("autoScrollSwitch"),
+    logStreamOutput: document.getElementById("logStreamOutput"),
+
+    passwordModal: document.getElementById("passwordModal"),
+    newPasswordInput: document.getElementById("newPasswordInput"),
+    submitChangePwdBtn: document.getElementById("submitChangePwdBtn"),
+    closeChangePwdBtn: document.getElementById("closeChangePwdBtn"),
   };
+
+  function escapeHtml(value) {
+    return String(value || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
 
   function setServiceStatus(ok, text) {
     els.serviceDot.className = ok ? "dot dot-on" : "dot dot-off";
     els.serviceText.textContent = text;
   }
 
-  function logTo(el, title, payload) {
+  function setLogStreamStatus(text, cls) {
+    els.logStreamStatus.textContent = text;
+    els.logStreamStatus.className = `status-badge ${cls}`;
+  }
+
+  function appendLog(el, title, payload) {
     const now = new Date().toLocaleTimeString();
-    const line = `[${now}] ${title}\n${typeof payload === "string" ? payload : JSON.stringify(payload, null, 2)}`;
-    el.textContent = line;
+    const body = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+    const line = `[${now}] ${title}\n${body}`;
+    el.textContent = line + (el.textContent ? `\n\n${el.textContent}` : "");
+  }
+
+  function setLoginMessage(message, isError) {
+    els.loginMessage.textContent = message;
+    els.loginMessage.style.color = isError ? "#b42318" : "#5f6c7b";
   }
 
   function formatDate(value) {
@@ -94,15 +155,29 @@
   function statusTag(status) {
     const s = (status || "").toLowerCase();
     if (["ready", "pending", "cooldown", "pending_external"].includes(s)) {
-      return `<span class="tag tag-active">${s}</span>`;
+      return `<span class="tag tag-active">${escapeHtml(s)}</span>`;
     }
     if (s === "unknown") {
-      return `<span class="tag tag-warn">unknown</span>`;
+      return '<span class="tag tag-warn">unknown</span>';
     }
-    return `<span class="tag tag-invalid">${s || "invalid"}</span>`;
+    return `<span class="tag tag-invalid">${escapeHtml(s || "invalid")}</span>`;
   }
 
-  async function apiFetch(path, options = {}) {
+  function parseResponsePayload(text) {
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      return text;
+    }
+  }
+
+  function formatError(status, payload) {
+    const body = typeof payload === "string" ? payload : JSON.stringify(payload || {});
+    return `[${status}] ${body}`;
+  }
+
+  async function panelFetch(path, options = {}) {
     const headers = Object.assign({}, options.headers || {});
     if (state.apiKey) {
       headers.Authorization = `Bearer ${state.apiKey}`;
@@ -110,35 +185,154 @@
     if (!headers["Content-Type"] && !(options.body instanceof FormData) && options.body) {
       headers["Content-Type"] = "application/json";
     }
-    const resp = await fetch(path, Object.assign({}, options, { headers }));
+
+    const resp = await fetch(path, Object.assign({}, options, {
+      headers,
+      credentials: "same-origin",
+    }));
     const text = await resp.text();
-    let body = null;
-    try {
-      body = text ? JSON.parse(text) : null;
-    } catch (e) {
-      body = text;
-    }
+    const body = parseResponsePayload(text);
+
     if (!resp.ok) {
-      throw new Error(`[${resp.status}] ${typeof body === "string" ? body : JSON.stringify(body)}`);
+      if (resp.status === 401 && !path.startsWith("/admin/panel/login") && !path.startsWith("/admin/panel/me")) {
+        setAuthState(false);
+        setLoginMessage("登录已失效，请重新登录。", true);
+      }
+      throw new Error(formatError(resp.status, body));
     }
     return body;
   }
 
-  async function loadStatus() {
-    try {
-      const status = await apiFetch("/admin/status");
-      setServiceStatus(true, "已连接");
-      els.statReady.textContent = status.ready ?? "-";
-      els.statPending.textContent = status.pending ?? "-";
-      els.statPendingExternal.textContent = status.pending_external ?? "-";
-      els.statInvalid.textContent = status.invalid ?? "0";
-      els.statAvailableToday.textContent = status.available_today ?? "-";
-      return status;
-    } catch (err) {
-      setServiceStatus(false, "鉴权失败或服务不可达");
-      logTo(els.actionLog, "状态加载失败", err.message);
-      return null;
+  async function llmFetch(path, options = {}) {
+    if (!state.apiKey) {
+      throw new Error("请先填写 API Key（用于 /v1 模型与调用测试）");
     }
+
+    const headers = Object.assign({}, options.headers || {});
+    headers.Authorization = `Bearer ${state.apiKey}`;
+    if (!headers["Content-Type"] && !(options.body instanceof FormData) && options.body) {
+      headers["Content-Type"] = "application/json";
+    }
+
+    const resp = await fetch(path, Object.assign({}, options, {
+      headers,
+      credentials: "same-origin",
+    }));
+    const text = await resp.text();
+    const body = parseResponsePayload(text);
+
+    if (!resp.ok) {
+      throw new Error(formatError(resp.status, body));
+    }
+    return body;
+  }
+
+  function setAuthState(authenticated, info = {}) {
+    state.session.authenticated = Boolean(authenticated);
+    state.session.username = authenticated ? info.username || "admin" : "";
+    state.session.expiresAt = authenticated ? info.expires_at || "" : "";
+
+    els.loginSection.classList.toggle("hidden", authenticated);
+    els.appSection.classList.toggle("hidden", !authenticated);
+    els.openChangePwdBtn.disabled = !authenticated;
+    els.logoutBtn.disabled = !authenticated;
+
+    if (authenticated) {
+      const expiresText = state.session.expiresAt ? `，过期：${formatDate(state.session.expiresAt)}` : "";
+      els.sessionInfo.textContent = `已登录：${state.session.username}${expiresText}`;
+      setLoginMessage("已登录，可直接使用管理能力。", false);
+    } else {
+      els.sessionInfo.textContent = "未登录";
+      setServiceStatus(false, "未连接");
+      closeLogStream();
+      setLogStreamStatus("未连接", "status-muted");
+      switchTab("console");
+    }
+  }
+
+  async function loadSession() {
+    try {
+      const me = await panelFetch("/admin/panel/me");
+      if (me && me.authenticated) {
+        setAuthState(true, me);
+        return true;
+      }
+      setAuthState(false);
+      return false;
+    } catch (err) {
+      setAuthState(false);
+      setLoginMessage(`会话检查失败：${err.message}`, true);
+      return false;
+    }
+  }
+
+  async function login() {
+    const username = (els.loginUsername.value || "").trim();
+    const password = (els.loginPassword.value || "").trim();
+    if (!username || !password) {
+      setLoginMessage("账号和密码不能为空。", true);
+      return;
+    }
+
+    const data = await panelFetch("/admin/panel/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+
+    els.loginPassword.value = "";
+    setAuthState(true, data || {});
+    setServiceStatus(true, "已连接");
+    appendLog(els.actionLog, "登录成功", { username: data.username, expires_at: data.expires_at });
+    await refreshAll();
+  }
+
+  async function logout() {
+    try {
+      await panelFetch("/admin/panel/logout", { method: "POST" });
+    } catch (err) {
+      appendLog(els.actionLog, "退出登录异常", err.message);
+    }
+    setAuthState(false);
+    setLoginMessage("已退出登录。", false);
+  }
+
+  function openPasswordModal() {
+    els.passwordModal.classList.remove("hidden");
+    els.newPasswordInput.value = "";
+    els.newPasswordInput.focus();
+  }
+
+  function closePasswordModal() {
+    els.passwordModal.classList.add("hidden");
+  }
+
+  async function changePassword() {
+    const newPassword = (els.newPasswordInput.value || "").trim();
+    if (newPassword.length < 6) {
+      appendLog(els.actionLog, "改密失败", "新密码长度至少 6 位");
+      return;
+    }
+
+    const data = await panelFetch("/admin/panel/change-password", {
+      method: "POST",
+      body: JSON.stringify({ new_password: newPassword }),
+    });
+
+    closePasswordModal();
+    appendLog(els.actionLog, "密码已修改", data);
+    setAuthState(false);
+    setLoginMessage("密码已更新，请使用新密码重新登录。", false);
+  }
+
+  async function loadStatus() {
+    const status = await panelFetch("/admin/status");
+    setServiceStatus(true, "已连接");
+    els.statReady.textContent = status.ready ?? "-";
+    els.statPending.textContent = status.pending ?? "-";
+    els.statPendingExternal.textContent = status.pending_external ?? "-";
+    els.statInvalid.textContent = status.invalid ?? "0";
+    els.statAvailableToday.textContent = status.available_today ?? "-";
+    return status;
   }
 
   async function loadAccounts() {
@@ -147,7 +341,7 @@
       status: els.accountStatusFilter.value,
       q: els.accountQFilter.value,
     });
-    const data = await apiFetch(`/admin/accounts?${params.toString()}`);
+    const data = await panelFetch(`/admin/accounts?${params.toString()}`);
     state.accounts = Array.isArray(data.items) ? data.items : [];
     state.accountsPage = 1;
     renderAccounts();
@@ -166,10 +360,10 @@
           ? '<span class="tag tag-active">有效</span>'
           : '<span class="tag tag-invalid">失效</span>';
         return `<tr>
-          <td title="${item.email || ""}">${item.email_masked || item.email || "-"}</td>
+          <td title="${escapeHtml(item.email || "")}">${escapeHtml(item.email_masked || item.email || "-")}</td>
           <td>${statusTag(item.status)}</td>
           <td>${validTag}</td>
-          <td>${item.invalid_reason || "-"}</td>
+          <td>${escapeHtml(item.invalid_reason || "-")}</td>
           <td>${item.fail_count ?? 0}</td>
           <td>${item.daily_remaining ?? "-"}</td>
           <td>${formatDate(item.last_used)}</td>
@@ -191,7 +385,7 @@
       page: String(state.filePage),
       page_size: String(state.filePageSize),
     });
-    const data = await apiFetch(`/admin/pool-files?${params.toString()}`);
+    const data = await panelFetch(`/admin/pool-files?${params.toString()}`);
     const items = Array.isArray(data.items) ? data.items : [];
 
     els.filesBody.innerHTML = items
@@ -200,9 +394,9 @@
           ? '<span class="tag tag-active">OK</span>'
           : '<span class="tag tag-invalid">Bad</span>';
         return `<tr>
-          <td>${item.file_name}</td>
-          <td>${item.email_from_filename}</td>
-          <td title="${item.parse_error || ""}">${parseTag}</td>
+          <td>${escapeHtml(item.file_name || "-")}</td>
+          <td>${escapeHtml(item.email_from_filename || "-")}</td>
+          <td title="${escapeHtml(item.parse_error || "")}">${parseTag}</td>
           <td>${statusTag(item.pool_status)}</td>
           <td>${item.exists_in_pool ? "是" : "否"}</td>
           <td>${item.has_config_id ? "有" : "无"}</td>
@@ -222,11 +416,23 @@
   }
 
   async function loadModels() {
-    const data = await apiFetch("/v1/models");
-    const models = Array.isArray(data.data) ? data.data.map((it) => it.id).filter(Boolean) : [];
+    if (!state.apiKey) {
+      els.modelsOutput.textContent = "未提供 API Key，无法访问 /v1/models。";
+      els.chatModelSelect.innerHTML = '<option value="">请先填写 API Key</option>';
+      return;
+    }
+
+    const data = await llmFetch("/v1/models");
+    const models = Array.isArray(data.data) ? data.data.map((item) => item.id).filter(Boolean) : [];
     state.models = models;
     els.modelsOutput.textContent = JSON.stringify(data, null, 2);
-    els.chatModelSelect.innerHTML = models.map((m) => `<option value="${m}">${m}</option>`).join("");
+
+    if (!models.length) {
+      els.chatModelSelect.innerHTML = '<option value="">无可用模型</option>';
+      return;
+    }
+
+    els.chatModelSelect.innerHTML = models.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join("");
 
     const savedTemplate = localStorage.getItem(CHAT_TEMPLATE_STORAGE);
     if (savedTemplate) {
@@ -236,7 +442,7 @@
         if (parsed.model && models.includes(parsed.model)) els.chatModelSelect.value = parsed.model;
         els.streamSwitch.checked = Boolean(parsed.stream);
       } catch (e) {
-        // ignore broken storage
+        // ignore
       }
     }
   }
@@ -248,19 +454,23 @@
       stream: els.streamSwitch.checked,
     };
     localStorage.setItem(CHAT_TEMPLATE_STORAGE, JSON.stringify(payload));
-    logTo(els.chatOutput, "模板已保存", payload);
+    appendLog(els.chatOutput, "模板已保存", payload);
   }
 
   async function sendChatTest() {
     const model = els.chatModelSelect.value;
     const prompt = els.chatPromptInput.value.trim();
     const stream = els.streamSwitch.checked;
+    if (!state.apiKey) {
+      appendLog(els.chatOutput, "请求被阻止", "调用测试依赖 API Key，请先在顶部保存 API Key。");
+      return;
+    }
     if (!model) {
-      logTo(els.chatOutput, "请求被阻止", "请先加载模型列表");
+      appendLog(els.chatOutput, "请求被阻止", "请先加载模型列表");
       return;
     }
     if (!prompt) {
-      logTo(els.chatOutput, "请求被阻止", "提示词不能为空");
+      appendLog(els.chatOutput, "请求被阻止", "提示词不能为空");
       return;
     }
 
@@ -270,13 +480,6 @@
       messages: [{ role: "user", content: prompt }],
     };
 
-    const headers = {
-      "Content-Type": "application/json",
-    };
-    if (state.apiKey) {
-      headers.Authorization = `Bearer ${state.apiKey}`;
-    }
-
     const started = performance.now();
     els.chatOutput.textContent = "";
     els.chatMeta.textContent = "请求中...";
@@ -284,7 +487,11 @@
     try {
       const resp = await fetch("/v1/chat/completions", {
         method: "POST",
-        headers,
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${state.apiKey}`,
+        },
         body: JSON.stringify(payload),
       });
 
@@ -340,6 +547,7 @@
           }
         }
       }
+
       const elapsed = Math.round(performance.now() - started);
       els.chatMeta.textContent = `流式结束: HTTP ${resp.status} | ${elapsed}ms`;
     } catch (err) {
@@ -361,10 +569,13 @@
       headers.Authorization = `Bearer ${state.apiKey}`;
     }
 
-    const resp = await fetch(`/admin/pool-files/export?${params.toString()}`, { headers });
+    const resp = await fetch(`/admin/pool-files/export?${params.toString()}`, {
+      headers,
+      credentials: "same-origin",
+    });
     if (!resp.ok) {
       const text = await resp.text();
-      throw new Error(`[${resp.status}] ${text}`);
+      throw new Error(formatError(resp.status, parseResponsePayload(text)));
     }
 
     const blob = await resp.blob();
@@ -391,74 +602,248 @@
     const resp = await fetch("/admin/pool-files/import", {
       method: "POST",
       headers,
+      credentials: "same-origin",
       body: form,
     });
 
     const text = await resp.text();
-    let body;
-    try {
-      body = text ? JSON.parse(text) : {};
-    } catch (e) {
-      body = text;
-    }
-
+    const body = parseResponsePayload(text);
     if (!resp.ok) {
-      throw new Error(`[${resp.status}] ${typeof body === "string" ? body : JSON.stringify(body)}`);
+      throw new Error(formatError(resp.status, body));
     }
     return body;
   }
 
   async function previewDeleteInvalid() {
-    const data = await apiFetch("/admin/pool-files/delete-invalid/preview", { method: "POST" });
+    const data = await panelFetch("/admin/pool-files/delete-invalid/preview", { method: "POST" });
     const candidates = Array.isArray(data.candidates) ? data.candidates : [];
-    state.deletePreviewFiles = candidates.map((it) => it.file_name).filter(Boolean);
-    logTo(els.fileActionLog, `预览完成: ${state.deletePreviewFiles.length} 个候选`, data);
+    state.deletePreviewFiles = candidates.map((item) => item.file_name).filter(Boolean);
+    appendLog(els.fileActionLog, `预览完成: ${state.deletePreviewFiles.length} 个候选`, data);
   }
 
   async function executeDeleteInvalid() {
     if (!state.deletePreviewFiles.length) {
       throw new Error("请先执行预览，再确认删除");
     }
-    const data = await apiFetch("/admin/pool-files/delete-invalid/execute", {
+    const data = await panelFetch("/admin/pool-files/delete-invalid/execute", {
       method: "POST",
       body: JSON.stringify({ files: state.deletePreviewFiles, auto_backup: true }),
     });
     state.deletePreviewFiles = [];
-    logTo(els.fileActionLog, "删除执行完成", data);
+    appendLog(els.fileActionLog, "删除执行完成", data);
   }
 
   async function triggerRegister() {
     const count = Math.max(1, Math.min(20, Number(els.registerCountInput.value || 1)));
-    const data = await apiFetch("/admin/registrar/trigger-register", {
+    const data = await panelFetch("/admin/registrar/trigger-register", {
       method: "POST",
       body: JSON.stringify({ count }),
     });
-    logTo(els.actionLog, `已触发注册 count=${count}`, data);
+    appendLog(els.actionLog, `已触发注册 count=${count}`, data);
+
+    if (state.logStream.paused) {
+      state.logStream.paused = false;
+      els.toggleLogStreamBtn.textContent = "暂停日志流";
+    }
+    switchTab("logs");
+    restartLogStream();
+    if (state.logStream.autoScroll) {
+      els.logStreamOutput.scrollTop = els.logStreamOutput.scrollHeight;
+    }
   }
 
   async function reloadPool() {
-    const data = await apiFetch("/admin/refresh", { method: "POST", body: "{}" });
-    logTo(els.actionLog, "号池已刷新", data);
+    const data = await panelFetch("/admin/refresh", { method: "POST", body: "{}" });
+    appendLog(els.actionLog, "号池已刷新", data);
   }
 
   async function refreshAll() {
-    await Promise.all([loadStatus(), loadAccounts(), loadFiles(), loadModels()]);
+    const results = await Promise.allSettled([loadStatus(), loadAccounts(), loadFiles(), loadModels()]);
+    const failed = results.filter((item) => item.status === "rejected");
+    if (failed.length) {
+      const reason = failed.map((item) => item.reason?.message || String(item.reason)).join("\n");
+      appendLog(els.actionLog, "部分加载失败", reason);
+    }
+  }
+
+  function trimLogOutput() {
+    const lines = els.logStreamOutput.textContent.split("\n");
+    if (lines.length <= 3000) {
+      return;
+    }
+    els.logStreamOutput.textContent = lines.slice(lines.length - 3000).join("\n");
+  }
+
+  function appendLogLines(lines) {
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return;
+    }
+    const chunk = lines.join("\n");
+    els.logStreamOutput.textContent += els.logStreamOutput.textContent ? `\n${chunk}` : chunk;
+    trimLogOutput();
+    if (state.logStream.autoScroll) {
+      els.logStreamOutput.scrollTop = els.logStreamOutput.scrollHeight;
+    }
+  }
+
+  function formatStreamLine(item) {
+    const ts = formatDate(item.ts);
+    const source = (item.source || "business2api").toString();
+    const level = (item.level || "info").toString().toUpperCase();
+    return `[${ts}] [${source}] [${level}] ${item.message || ""}`;
+  }
+
+  function closeLogStream() {
+    if (state.logStream.eventSource) {
+      state.logStream.eventSource.close();
+      state.logStream.eventSource = null;
+    }
+  }
+
+  function startLogStream(forceRestart) {
+    if (!state.session.authenticated || state.logStream.paused) {
+      return;
+    }
+    if (state.logStream.eventSource && !forceRestart) {
+      return;
+    }
+
+    closeLogStream();
+    const params = new URLSearchParams({
+      source: state.logStream.source,
+      level: state.logStream.level,
+      bootstrap_limit: "200",
+      poll_ms: "1000",
+    });
+
+    const es = new EventSource(`/admin/logs/stream?${params.toString()}`, { withCredentials: true });
+    state.logStream.eventSource = es;
+    setLogStreamStatus("连接中...", "status-muted");
+
+    es.onopen = function () {
+      setLogStreamStatus("实时流已连接", "status-ok");
+    };
+
+    es.addEventListener("logs", function (event) {
+      try {
+        const payload = JSON.parse(event.data || "{}");
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        appendLogLines(items.map(formatStreamLine));
+      } catch (err) {
+        appendLogLines([`[${new Date().toLocaleString()}] [system] [WARN] 日志解析失败: ${err.message}`]);
+      }
+    });
+
+    es.addEventListener("system", function (event) {
+      let message = "系统通知";
+      try {
+        const payload = JSON.parse(event.data || "{}");
+        if (payload.message) {
+          message = payload.message;
+        }
+      } catch (err) {
+        if (event.data) {
+          message = event.data;
+        }
+      }
+      appendLogLines([`[${new Date().toLocaleString()}] [system] [INFO] ${message}`]);
+    });
+
+    es.addEventListener("ping", function () {
+      // 保活事件无需渲染
+    });
+
+    es.onerror = function () {
+      if (state.logStream.paused) {
+        return;
+      }
+      setLogStreamStatus("连接异常，自动重连中", "status-warn");
+    };
+  }
+
+  function restartLogStream() {
+    if (state.activeTab !== "logs") {
+      return;
+    }
+    startLogStream(true);
+  }
+
+  function switchTab(tab) {
+    state.activeTab = tab;
+    const isConsole = tab === "console";
+    els.tabBtnConsole.classList.toggle("active", isConsole);
+    els.tabBtnLogs.classList.toggle("active", !isConsole);
+    els.tabConsole.classList.toggle("active", isConsole);
+    els.tabLogs.classList.toggle("active", !isConsole);
+
+    if (isConsole) {
+      closeLogStream();
+      setLogStreamStatus(state.logStream.paused ? "已暂停" : "未连接", "status-muted");
+      return;
+    }
+
+    if (!state.logStream.paused) {
+      startLogStream(true);
+    } else {
+      setLogStreamStatus("已暂停", "status-muted");
+    }
   }
 
   function bindEvents() {
     els.apiKeyInput.value = state.apiKey;
+
     els.saveKeyBtn.addEventListener("click", async () => {
-      state.apiKey = els.apiKeyInput.value.trim();
+      state.apiKey = (els.apiKeyInput.value || "").trim();
       localStorage.setItem(API_KEY_STORAGE, state.apiKey);
-      await refreshAll();
+      appendLog(els.actionLog, "API Key 已保存", { configured: Boolean(state.apiKey) });
+      if (state.session.authenticated) {
+        await loadModels().catch((err) => appendLog(els.modelsOutput, "模型加载失败", err.message));
+      }
     });
+
+    els.loginBtn.addEventListener("click", async () => {
+      try {
+        await login();
+      } catch (err) {
+        setLoginMessage(`登录失败：${err.message}`, true);
+      }
+    });
+
+    els.loginPassword.addEventListener("keydown", async (event) => {
+      if (event.key !== "Enter") return;
+      try {
+        await login();
+      } catch (err) {
+        setLoginMessage(`登录失败：${err.message}`, true);
+      }
+    });
+
+    els.logoutBtn.addEventListener("click", logout);
+    els.openChangePwdBtn.addEventListener("click", openPasswordModal);
+    els.closeChangePwdBtn.addEventListener("click", closePasswordModal);
+    els.submitChangePwdBtn.addEventListener("click", async () => {
+      try {
+        await changePassword();
+      } catch (err) {
+        appendLog(els.actionLog, "改密失败", err.message);
+      }
+    });
+
+    els.passwordModal.addEventListener("click", (event) => {
+      if (event.target === els.passwordModal) {
+        closePasswordModal();
+      }
+    });
+
+    els.tabBtnConsole.addEventListener("click", () => switchTab("console"));
+    els.tabBtnLogs.addEventListener("click", () => switchTab("logs"));
 
     els.reloadPoolBtn.addEventListener("click", async () => {
       try {
         await reloadPool();
         await refreshAll();
       } catch (err) {
-        logTo(els.actionLog, "刷新失败", err.message);
+        appendLog(els.actionLog, "刷新失败", err.message);
       }
     });
 
@@ -466,7 +851,7 @@
       try {
         await triggerRegister();
       } catch (err) {
-        logTo(els.actionLog, "触发注册失败", err.message);
+        appendLog(els.actionLog, "触发注册失败", err.message);
       }
     });
 
@@ -474,7 +859,7 @@
       try {
         await refreshAll();
       } catch (err) {
-        logTo(els.actionLog, "刷新失败", err.message);
+        appendLog(els.actionLog, "刷新失败", err.message);
       }
     });
 
@@ -482,7 +867,7 @@
       try {
         await loadAccounts();
       } catch (err) {
-        logTo(els.actionLog, "账号筛选失败", err.message);
+        appendLog(els.actionLog, "账号筛选失败", err.message);
       }
     });
 
@@ -490,6 +875,7 @@
       state.accountsPage -= 1;
       renderAccounts();
     });
+
     els.accountsNextBtn.addEventListener("click", () => {
       state.accountsPage += 1;
       renderAccounts();
@@ -500,7 +886,7 @@
       try {
         await loadFiles();
       } catch (err) {
-        logTo(els.fileActionLog, "文件筛选失败", err.message);
+        appendLog(els.fileActionLog, "文件筛选失败", err.message);
       }
     });
 
@@ -510,7 +896,7 @@
       try {
         await loadFiles();
       } catch (err) {
-        logTo(els.fileActionLog, "翻页失败", err.message);
+        appendLog(els.fileActionLog, "翻页失败", err.message);
       }
     });
 
@@ -520,16 +906,16 @@
       try {
         await loadFiles();
       } catch (err) {
-        logTo(els.fileActionLog, "翻页失败", err.message);
+        appendLog(els.fileActionLog, "翻页失败", err.message);
       }
     });
 
     els.exportZipBtn.addEventListener("click", async () => {
       try {
         await exportPoolFiles();
-        logTo(els.fileActionLog, "导出成功", "ZIP 已开始下载");
+        appendLog(els.fileActionLog, "导出成功", "ZIP 已开始下载");
       } catch (err) {
-        logTo(els.fileActionLog, "导出失败", err.message);
+        appendLog(els.fileActionLog, "导出失败", err.message);
       }
     });
 
@@ -538,11 +924,11 @@
       if (!file) return;
       try {
         const data = await importPoolFiles(file);
-        logTo(els.fileActionLog, "导入完成", data);
+        appendLog(els.fileActionLog, "导入完成", data);
         evt.target.value = "";
         await refreshAll();
       } catch (err) {
-        logTo(els.fileActionLog, "导入失败", err.message);
+        appendLog(els.fileActionLog, "导入失败", err.message);
       }
     });
 
@@ -550,7 +936,7 @@
       try {
         await previewDeleteInvalid();
       } catch (err) {
-        logTo(els.fileActionLog, "预览失败", err.message);
+        appendLog(els.fileActionLog, "预览失败", err.message);
       }
     });
 
@@ -559,7 +945,7 @@
         await executeDeleteInvalid();
         await refreshAll();
       } catch (err) {
-        logTo(els.fileActionLog, "删除失败", err.message);
+        appendLog(els.fileActionLog, "删除失败", err.message);
       }
     });
 
@@ -567,21 +953,60 @@
       try {
         await loadModels();
       } catch (err) {
-        logTo(els.modelsOutput, "模型刷新失败", err.message);
+        appendLog(els.modelsOutput, "模型刷新失败", err.message);
       }
     });
 
     els.sendChatBtn.addEventListener("click", sendChatTest);
     els.saveTemplateBtn.addEventListener("click", saveTemplate);
+
+    els.logSourceSelect.addEventListener("change", () => {
+      state.logStream.source = els.logSourceSelect.value;
+      restartLogStream();
+    });
+
+    els.logLevelSelect.addEventListener("change", () => {
+      state.logStream.level = els.logLevelSelect.value;
+      restartLogStream();
+    });
+
+    els.toggleLogStreamBtn.addEventListener("click", () => {
+      state.logStream.paused = !state.logStream.paused;
+      els.toggleLogStreamBtn.textContent = state.logStream.paused ? "继续日志流" : "暂停日志流";
+      if (state.logStream.paused) {
+        closeLogStream();
+        setLogStreamStatus("已暂停", "status-muted");
+      } else {
+        restartLogStream();
+      }
+    });
+
+    els.clearLogViewBtn.addEventListener("click", () => {
+      els.logStreamOutput.textContent = "";
+    });
+
+    els.autoScrollSwitch.addEventListener("change", () => {
+      state.logStream.autoScroll = Boolean(els.autoScrollSwitch.checked);
+    });
   }
 
   async function bootstrap() {
     bindEvents();
+
+    state.logStream.source = els.logSourceSelect.value;
+    state.logStream.level = els.logLevelSelect.value;
+    state.logStream.autoScroll = Boolean(els.autoScrollSwitch.checked);
+
+    const ok = await loadSession();
+    if (!ok) {
+      setLoginMessage("请输入账号和密码登录。", false);
+      return;
+    }
+
     try {
       await refreshAll();
     } catch (err) {
-      setServiceStatus(false, "初始化失败");
-      logTo(els.actionLog, "初始化失败", err.message);
+      appendLog(els.actionLog, "初始化失败", err.message);
     }
   }
 
