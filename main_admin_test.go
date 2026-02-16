@@ -145,6 +145,34 @@ func doAuthedMultipartRequest(t *testing.T, r *gin.Engine, target, filename stri
 	return w
 }
 
+func doAuthedMultipartRequestMulti(t *testing.T, r *gin.Engine, target string, files map[string][]byte) *httptest.ResponseRecorder {
+	t.Helper()
+	body := bytes.NewBuffer(nil)
+	mw := multipart.NewWriter(body)
+	for name, payload := range files {
+		part, err := mw.CreateFormFile("files", name)
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := part.Write(payload); err != nil {
+			t.Fatalf("write form payload: %v", err)
+		}
+	}
+	if err := mw.WriteField("overwrite", "true"); err != nil {
+		t.Fatalf("write overwrite field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, target, body)
+	req.Header.Set("Authorization", "Bearer "+testAdminAPIKey)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
 func decodeJSONBody(t *testing.T, raw string) map[string]interface{} {
 	t.Helper()
 	var out map[string]interface{}
@@ -579,6 +607,48 @@ func TestPoolFilesImportSingleJSON(t *testing.T) {
 	body := decodeJSONBody(t, resp.Body.String())
 	if got := int(body["success"].(float64)); got != 1 {
 		t.Fatalf("expected success=1 got %d body=%s", got, resp.Body.String())
+	}
+}
+
+func TestPoolFilesImportMultipleJSONFiles(t *testing.T) {
+	r, dir, restore := newAdminTestRouter(t)
+	defer restore()
+
+	accA := makeAccount("batch-a@example.com", "cfg-a", "a101", "Bearer a")
+	accB := makeAccount("batch-b@example.com", "cfg-b", "b202", "Bearer b")
+	rawA, err := json.Marshal(accA)
+	if err != nil {
+		t.Fatalf("marshal account A: %v", err)
+	}
+	rawB, err := json.Marshal(accB)
+	if err != nil {
+		t.Fatalf("marshal account B: %v", err)
+	}
+
+	resp := doAuthedMultipartRequestMulti(t, r, "/admin/pool-files/import", map[string][]byte{
+		"batch-a.json": rawA,
+		"batch-b.json": rawB,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("multi import status=%d body=%s", resp.Code, resp.Body.String())
+	}
+
+	body := decodeJSONBody(t, resp.Body.String())
+	if got := int(body["total"].(float64)); got != 2 {
+		t.Fatalf("expected total=2 got %d body=%s", got, resp.Body.String())
+	}
+	if got := int(body["success"].(float64)); got != 2 {
+		t.Fatalf("expected success=2 got %d body=%s", got, resp.Body.String())
+	}
+	if got := int(body["failed"].(float64)); got != 0 {
+		t.Fatalf("expected failed=0 got %d body=%s", got, resp.Body.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "batch-a@example.com.json")); err != nil {
+		t.Fatalf("account A file not found: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "batch-b@example.com.json")); err != nil {
+		t.Fatalf("account B file not found: %v", err)
 	}
 }
 

@@ -613,9 +613,12 @@
     URL.revokeObjectURL(url);
   }
 
-  async function importPoolFiles(file) {
+  async function importPoolFiles(files) {
+    if (!Array.isArray(files) || !files.length) {
+      throw new Error("请选择至少一个 ZIP/JSON 文件");
+    }
     const form = new FormData();
-    form.append("file", file);
+    files.forEach((file) => form.append("files", file));
     form.append("overwrite", "true");
 
     const headers = {};
@@ -944,10 +947,10 @@
     });
 
     els.importFileInput.addEventListener("change", async (evt) => {
-      const file = evt.target.files && evt.target.files[0];
-      if (!file) return;
+      const files = Array.from((evt.target.files && evt.target.files) || []);
+      if (!files.length) return;
       try {
-        const data = await importPoolFiles(file);
+        const data = await importPoolFiles(files);
         appendLog(els.fileActionLog, "导入完成", data);
         evt.target.value = "";
         await refreshAll();

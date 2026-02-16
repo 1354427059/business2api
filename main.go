@@ -14,6 +14,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -4267,27 +4268,29 @@ func importSingleAccountPayload(name string, payload []byte, overwrite bool, res
 }
 
 func handlePoolFilesImport(c *gin.Context) {
-	fileHeader, err := c.FormFile("file")
-	if err != nil {
-		c.JSON(400, gin.H{"error": "缺少上传文件字段 file"})
-		return
-	}
-
 	overwrite := true
 	if raw := strings.TrimSpace(c.PostForm("overwrite")); raw != "" {
 		overwrite = strings.EqualFold(raw, "true") || raw == "1"
 	}
 
-	fileReader, err := fileHeader.Open()
-	if err != nil {
-		c.JSON(400, gin.H{"error": fmt.Sprintf("打开上传文件失败: %v", err)})
-		return
+	var fileHeaders []*multipart.FileHeader
+	if form, err := c.MultipartForm(); err == nil && form != nil {
+		if files, ok := form.File["files"]; ok && len(files) > 0 {
+			fileHeaders = append(fileHeaders, files...)
+		}
+		if len(fileHeaders) == 0 {
+			if files, ok := form.File["file"]; ok && len(files) > 0 {
+				fileHeaders = append(fileHeaders, files...)
+			}
+		}
 	}
-	defer fileReader.Close()
-
-	payload, err := io.ReadAll(fileReader)
-	if err != nil {
-		c.JSON(400, gin.H{"error": fmt.Sprintf("读取上传文件失败: %v", err)})
+	if len(fileHeaders) == 0 {
+		if single, err := c.FormFile("file"); err == nil && single != nil {
+			fileHeaders = append(fileHeaders, single)
+		}
+	}
+	if len(fileHeaders) == 0 {
+		c.JSON(400, gin.H{"error": "缺少上传文件字段 files/file"})
 		return
 	}
 
@@ -4295,50 +4298,95 @@ func handlePoolFilesImport(c *gin.Context) {
 		Errors:         make([]string, 0),
 		ImportedEmails: make([]string, 0),
 	}
-	lowerName := strings.ToLower(fileHeader.Filename)
+	importAttempted := false
 
-	switch {
-	case strings.HasSuffix(lowerName, ".json"):
-		importSingleAccountPayload(fileHeader.Filename, payload, overwrite, result)
-	case strings.HasSuffix(lowerName, ".zip"):
-		zipReader, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
-		if err != nil {
-			c.JSON(400, gin.H{"error": fmt.Sprintf("ZIP 解析失败: %v", err)})
-			return
+	for _, fileHeader := range fileHeaders {
+		if fileHeader == nil {
+			continue
+		}
+		fileName := strings.TrimSpace(fileHeader.Filename)
+		if fileName == "" {
+			result.Total++
+			result.Failed++
+			result.Errors = append(result.Errors, "上传文件名称为空")
+			continue
 		}
 
-		foundJSON := false
-		for _, file := range zipReader.File {
-			if file.FileInfo().IsDir() {
-				continue
-			}
-			if !strings.HasSuffix(strings.ToLower(file.Name), ".json") {
-				continue
-			}
-			foundJSON = true
-			entry, err := file.Open()
+		fileReader, err := fileHeader.Open()
+		if err != nil {
+			result.Total++
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: 打开上传文件失败: %v", fileName, err))
+			continue
+		}
+
+		payload, err := io.ReadAll(fileReader)
+		_ = fileReader.Close()
+		if err != nil {
+			result.Total++
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: 读取上传文件失败: %v", fileName, err))
+			continue
+		}
+
+		lowerName := strings.ToLower(fileName)
+		switch {
+		case strings.HasSuffix(lowerName, ".json"):
+			importSingleAccountPayload(fileName, payload, overwrite, result)
+			importAttempted = true
+		case strings.HasSuffix(lowerName, ".zip"):
+			zipReader, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
 			if err != nil {
 				result.Total++
 				result.Failed++
-				result.Errors = append(result.Errors, fmt.Sprintf("%s: 打开 ZIP 条目失败: %v", file.Name, err))
+				result.Errors = append(result.Errors, fmt.Sprintf("%s: ZIP 解析失败: %v", fileName, err))
 				continue
 			}
-			entryPayload, readErr := io.ReadAll(entry)
-			_ = entry.Close()
-			if readErr != nil {
+
+			foundJSON := false
+			for _, file := range zipReader.File {
+				if file.FileInfo().IsDir() {
+					continue
+				}
+				if !strings.HasSuffix(strings.ToLower(file.Name), ".json") {
+					continue
+				}
+				foundJSON = true
+				entry, err := file.Open()
+				if err != nil {
+					result.Total++
+					result.Failed++
+					result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: 打开 ZIP 条目失败: %v", fileName, file.Name, err))
+					continue
+				}
+				entryPayload, readErr := io.ReadAll(entry)
+				_ = entry.Close()
+				if readErr != nil {
+					result.Total++
+					result.Failed++
+					result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: 读取 ZIP 条目失败: %v", fileName, file.Name, readErr))
+					continue
+				}
+				importSingleAccountPayload(file.Name, entryPayload, overwrite, result)
+				importAttempted = true
+			}
+			if !foundJSON {
 				result.Total++
 				result.Failed++
-				result.Errors = append(result.Errors, fmt.Sprintf("%s: 读取 ZIP 条目失败: %v", file.Name, readErr))
-				continue
+				result.Errors = append(result.Errors, fmt.Sprintf("%s: ZIP 内未找到 JSON 文件", fileName))
 			}
-			importSingleAccountPayload(file.Name, entryPayload, overwrite, result)
+		default:
+			result.Total++
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: 仅支持 .zip 或 .json 文件", fileName))
 		}
-		if !foundJSON {
-			c.JSON(400, gin.H{"error": "ZIP 内未找到 JSON 文件"})
-			return
-		}
-	default:
-		c.JSON(400, gin.H{"error": "仅支持 .zip 或 .json 文件"})
+	}
+
+	if !importAttempted {
+		c.JSON(400, gin.H{
+			"error":   "未检测到可导入的 JSON 账号文件",
+			"details": result.Errors,
+		})
 		return
 	}
 

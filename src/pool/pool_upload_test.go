@@ -143,6 +143,42 @@ func TestProcessAccountUploadPreserveFieldsForRefresh(t *testing.T) {
 	}
 }
 
+func TestLoadSkipsAdminPanelAuthFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// 面板认证文件应被号池加载逻辑忽略
+	adminAuthRaw := []byte(`{"version":1,"username":"admin","password_hash":"x","updated_at":"2026-02-16T00:00:00Z"}`)
+	if err := os.WriteFile(filepath.Join(dir, "admin_panel_auth.json"), adminAuthRaw, 0644); err != nil {
+		t.Fatalf("write admin auth file: %v", err)
+	}
+
+	account := AccountData{
+		Email:         "valid@example.com",
+		FullName:      "Tester",
+		Authorization: "Bearer token-CSESIDX=101",
+		CSESIDX:       "101",
+		Cookies: []Cookie{
+			{Name: "__Secure-C_SES", Value: "cookie", Domain: ".gemini.google"},
+		},
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	raw, _ := json.Marshal(account)
+	if err := os.WriteFile(filepath.Join(dir, "valid@example.com.json"), raw, 0644); err != nil {
+		t.Fatalf("write account file: %v", err)
+	}
+
+	p := newTestPool()
+	if err := p.Load(dir); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if got := len(p.pendingAccounts); got != 1 {
+		t.Fatalf("expected 1 pending account, got %d", got)
+	}
+	if p.pendingAccounts[0].Data.Email != "valid@example.com" {
+		t.Fatalf("unexpected pending email: %s", p.pendingAccounts[0].Data.Email)
+	}
+}
+
 func TestExternalRefreshTasksAndQueueSelection(t *testing.T) {
 	p := newTestPool()
 	external := &Account{

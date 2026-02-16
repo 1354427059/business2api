@@ -97,6 +97,12 @@ var activeStatuses = map[string]struct{}{
 	"pending_external": {},
 }
 
+const adminPanelAuthFileName = "admin_panel_auth.json"
+
+func shouldSkipAccountFile(path string) bool {
+	return strings.EqualFold(filepath.Base(path), adminPanelAuthFileName)
+}
+
 // NormalizeStatus 统一状态值格式
 func NormalizeStatus(status string) string {
 	return strings.ToLower(strings.TrimSpace(status))
@@ -331,6 +337,10 @@ func (p *AccountPool) Load(dir string) error {
 	var newPendingAccounts []*Account
 
 	for _, f := range files {
+		if shouldSkipAccountFile(f) {
+			continue
+		}
+
 		if acc, ok := existingAccounts[f]; ok {
 			if acc.Refreshed {
 				newReadyAccounts = append(newReadyAccounts, acc)
