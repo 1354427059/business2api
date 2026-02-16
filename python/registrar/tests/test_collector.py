@@ -40,6 +40,8 @@ class CollectorTest(unittest.TestCase):
 			"email": "demo@example.com",
 			"cookies": [{"name": "a", "value": "1", "domain": ".gemini.google"}],
 			"authorization": "Bearer token",
+			"authorization_source": "network",
+			"fallback_used": False,
 			"config_id": "cfg",
 			"csesidx": "123",
 			"is_new": False,
@@ -61,6 +63,16 @@ class CollectorTest(unittest.TestCase):
 		missing_name_for_new["full_name"] = ""
 		with self.assertRaises(ValueError):
 			validate_payload(missing_name_for_new)
+
+		invalid_source = dict(payload)
+		invalid_source["authorization_source"] = "invalid"
+		with self.assertRaises(ValueError):
+			validate_payload(invalid_source)
+
+		invalid_fallback = dict(payload)
+		invalid_fallback["fallback_used"] = True
+		with self.assertRaises(ValueError):
+			validate_payload(invalid_fallback)
 
 
 if __name__ == "__main__":

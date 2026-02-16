@@ -81,6 +81,8 @@ Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
 
 
 def _mail_headers(settings: Settings) -> Dict[str, str]:
+	if not settings.mail_key:
+		raise RuntimeError("MAIL_KEY 未配置，无法访问邮箱服务")
 	return {
 		"X-API-Key": settings.mail_key,
 		"User-Agent": "Mozilla/5.0 (compatible; registrar/1.0)",

@@ -24,8 +24,11 @@ class RegistrarScheduler:
 		self._metrics: Dict[str, Any] = {
 			"register_success": 0,
 			"register_failed": 0,
+			"refresh_claimed": 0,
 			"refresh_success": 0,
 			"refresh_failed": 0,
+			"refresh_fallback_used": 0,
+			"refresh_throttled_cycles": 0,
 			"last_error": "",
 			"last_register_run": 0,
 			"last_refresh_run": 0,
@@ -120,17 +123,42 @@ class RegistrarScheduler:
 			return
 		try:
 			task_limit = self.settings.refresh_batch_limit if limit is None else max(1, int(limit))
-			tasks = self.client.get_refresh_tasks(limit=task_limit)
+			claim_result = self.client.claim_refresh_tasks(
+				worker_id=self.settings.worker_id,
+				limit=task_limit,
+				lease_sec=self.settings.refresh_task_lease_sec,
+			)
+			tasks = claim_result.get("tasks") or []
+			throttled = bool(claim_result.get("throttled", False))
+			if throttled:
+				logger.warning("refresh claim 已触发限流: worker=%s", self.settings.worker_id)
+				with self._metrics_lock:
+					self._metrics["refresh_throttled_cycles"] += 1
 			if not tasks:
 				return
+			with self._metrics_lock:
+				self._metrics["refresh_claimed"] += len(tasks)
 			for task in tasks:
+				task_id = str(task.get("task_id", "")).strip()
 				try:
 					payload = refresh_one(self.settings, task)
+					payload["task_id"] = task_id
+					payload["worker_id"] = self.settings.worker_id
 					self.client.upload_account(payload)
 					with self._metrics_lock:
 						self._metrics["refresh_success"] += 1
+						if payload.get("fallback_used", False):
+							self._metrics["refresh_fallback_used"] += 1
 				except Exception as exc:
+					err_msg = str(exc)
 					self._set_error(exc)
+					if task_id:
+						try:
+							self.client.fail_refresh_task(task_id=task_id, worker_id=self.settings.worker_id, err_msg=err_msg)
+						except Exception as fail_exc:
+							self._set_error(fail_exc)
+					else:
+						logger.warning("续期任务缺少 task_id，无法回报失败: task=%s", task)
 					with self._metrics_lock:
 						self._metrics["refresh_failed"] += 1
 			with self._metrics_lock:

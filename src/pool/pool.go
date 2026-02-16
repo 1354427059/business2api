@@ -167,6 +167,11 @@ type Account struct {
 	TotalCount          int    // 总使用次数
 	DailyCount          int    // 每日调用次数
 	DailyCountDate      string // 每日计数日期 (YYYY-MM-DD)
+	ExternalTaskID      string
+	ExternalLeaseOwner  string
+	ExternalLeaseUntil  time.Time
+	ExternalFailCount   int
+	ExternalRetryAt     time.Time
 	Status              AccountStatus
 	Mu                  sync.Mutex
 }
@@ -195,6 +200,15 @@ var (
 	Proxy                  string
 	JwtTTL                 = 270 * time.Second
 	HTTPClient             *http.Client
+)
+
+const (
+	externalRefreshFailAlertThreshold     = 0.3
+	externalRefreshFallbackAlertThreshold = 0.2
+	externalRefreshThrottleSampleMin      = 20
+	externalRefreshThrottleRatio          = 0.5
+	defaultExternalTaskLeaseSec           = 180
+	maxExternalTaskLeaseSec               = 1800
 )
 
 type RefreshCookieFunc func(acc *Account, headless bool, proxy string) *BrowserRefreshResult
@@ -226,16 +240,25 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 }
 
 type AccountPool struct {
-	readyAccounts   []*Account
-	pendingAccounts []*Account
-	index           uint64
-	mu              sync.RWMutex
-	refreshInterval time.Duration
-	refreshWorkers  int
-	stopChan        chan struct{}
-	totalSuccess    int64
-	totalFailed     int64
-	totalRequests   int64
+	readyAccounts                 []*Account
+	pendingAccounts               []*Account
+	index                         uint64
+	mu                            sync.RWMutex
+	refreshInterval               time.Duration
+	refreshWorkers                int
+	stopChan                      chan struct{}
+	totalSuccess                  int64
+	totalFailed                   int64
+	totalRequests                 int64
+	externalTaskSeq               uint64
+	externalRefreshClaimTotal     int64
+	externalRefreshSuccessTotal   int64
+	externalRefreshFailedTotal    int64
+	externalRefreshLeaseExpired   int64
+	externalRefreshFallbackTotal  int64
+	externalRefreshThrottleActive bool
+	externalRefreshFailAlert      bool
+	externalRefreshFallbackAlert  bool
 }
 
 func (p *AccountPool) GetReadyAccounts() []*Account {
@@ -440,10 +463,110 @@ func (p *AccountPool) MarkExternalRefreshPending(acc *Account) {
 	acc.Refreshed = false
 	acc.LastRefresh = time.Time{}
 	acc.Status = StatusPendingExternal
+	acc.ExternalTaskID = ""
+	acc.ExternalLeaseOwner = ""
+	acc.ExternalLeaseUntil = time.Time{}
+	acc.ExternalRetryAt = time.Time{}
 	acc.Mu.Unlock()
 
 	p.pendingAccounts = append(p.pendingAccounts, acc)
 	log.Printf("🧩 账号 %s 标记为待外部续期", filepath.Base(acc.FilePath))
+}
+
+func normalizeExternalClaimLimit(limit int) int {
+	if limit <= 0 {
+		return 20
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+func normalizeExternalLeaseSec(leaseSec int) int {
+	if leaseSec <= 0 {
+		return defaultExternalTaskLeaseSec
+	}
+	if leaseSec > maxExternalTaskLeaseSec {
+		return maxExternalTaskLeaseSec
+	}
+	return leaseSec
+}
+
+func externalTaskBackoff(failCount int) time.Duration {
+	if failCount <= 0 {
+		failCount = 1
+	}
+	sec := 30 * (1 << (failCount - 1))
+	if sec > 300 {
+		sec = 300
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func (p *AccountPool) externalMetricsLocked() (int64, int64, int64, int64, int64, float64, float64, bool) {
+	claimTotal := atomic.LoadInt64(&p.externalRefreshClaimTotal)
+	successTotal := atomic.LoadInt64(&p.externalRefreshSuccessTotal)
+	failedTotal := atomic.LoadInt64(&p.externalRefreshFailedTotal)
+	leaseExpiredTotal := atomic.LoadInt64(&p.externalRefreshLeaseExpired)
+	fallbackTotal := atomic.LoadInt64(&p.externalRefreshFallbackTotal)
+	completed := successTotal + failedTotal
+
+	successRate := float64(0)
+	fallbackRatio := float64(0)
+	if completed > 0 {
+		successRate = float64(successTotal) / float64(completed)
+		fallbackRatio = float64(fallbackTotal) / float64(completed)
+	}
+	throttled := completed >= externalRefreshThrottleSampleMin && fallbackRatio >= externalRefreshThrottleRatio
+	return claimTotal, successTotal, failedTotal, leaseExpiredTotal, fallbackTotal, successRate, fallbackRatio, throttled
+}
+
+func (p *AccountPool) updateExternalAlertStateLocked() {
+	_, successTotal, failedTotal, _, _, successRate, fallbackRatio, throttled := p.externalMetricsLocked()
+	completed := successTotal + failedTotal
+
+	failRatio := float64(0)
+	if completed > 0 {
+		failRatio = 1 - successRate
+	}
+	failAlert := completed > 0 && failRatio >= externalRefreshFailAlertThreshold
+	fallbackAlert := completed > 0 && fallbackRatio >= externalRefreshFallbackAlertThreshold
+
+	if failAlert && !p.externalRefreshFailAlert {
+		logger.Warn("ALERT_REFRESH_FAIL_RATIO ratio=%.3f threshold=%.3f sample=%d", failRatio, externalRefreshFailAlertThreshold, completed)
+	}
+	if !failAlert && p.externalRefreshFailAlert {
+		logger.Info("ALERT_REFRESH_FAIL_RATIO_RECOVER ratio=%.3f threshold=%.3f sample=%d", failRatio, externalRefreshFailAlertThreshold, completed)
+	}
+	if fallbackAlert && !p.externalRefreshFallbackAlert {
+		logger.Warn("ALERT_FALLBACK_RATIO ratio=%.3f threshold=%.3f sample=%d", fallbackRatio, externalRefreshFallbackAlertThreshold, completed)
+	}
+	if !fallbackAlert && p.externalRefreshFallbackAlert {
+		logger.Info("ALERT_FALLBACK_RATIO_RECOVER ratio=%.3f threshold=%.3f sample=%d", fallbackRatio, externalRefreshFallbackAlertThreshold, completed)
+	}
+	if throttled && !p.externalRefreshThrottleActive {
+		logger.Warn("ALERT_FALLBACK_THROTTLE ratio=%.3f threshold=%.3f sample=%d", fallbackRatio, externalRefreshThrottleRatio, completed)
+	}
+	if !throttled && p.externalRefreshThrottleActive {
+		logger.Info("ALERT_FALLBACK_THROTTLE_RECOVER ratio=%.3f threshold=%.3f sample=%d", fallbackRatio, externalRefreshThrottleRatio, completed)
+	}
+
+	p.externalRefreshFailAlert = failAlert
+	p.externalRefreshFallbackAlert = fallbackAlert
+	p.externalRefreshThrottleActive = throttled
+}
+
+func (p *AccountPool) externalTaskByIDLocked(taskID string) *Account {
+	for _, acc := range p.pendingAccounts {
+		acc.Mu.Lock()
+		matched := acc.ExternalTaskID == taskID
+		acc.Mu.Unlock()
+		if matched {
+			return acc
+		}
+	}
+	return nil
 }
 
 // RemoveAccount 删除失效账号
@@ -876,18 +999,25 @@ func (p *AccountPool) MarkNeedsRefresh(acc *Account) {
 
 // ExternalRefreshTasks 获取待外部续期的任务列表
 func (p *AccountPool) ExternalRefreshTasks(limit int) []AccountUploadRequest {
-	if limit <= 0 {
-		limit = 20
-	}
+	limit = normalizeExternalClaimLimit(limit)
 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	tasks := make([]AccountUploadRequest, 0, limit)
+	now := time.Now()
 	for _, acc := range p.pendingAccounts {
 		acc.Mu.Lock()
 		status := acc.Status
 		if status != StatusPendingExternal {
+			acc.Mu.Unlock()
+			continue
+		}
+		if !acc.ExternalRetryAt.IsZero() && now.Before(acc.ExternalRetryAt) {
+			acc.Mu.Unlock()
+			continue
+		}
+		if !acc.ExternalLeaseUntil.IsZero() && now.Before(acc.ExternalLeaseUntil) && acc.ExternalTaskID != "" {
 			acc.Mu.Unlock()
 			continue
 		}
@@ -917,6 +1047,162 @@ func (p *AccountPool) ExternalRefreshTasks(limit int) []AccountUploadRequest {
 		}
 	}
 	return tasks
+}
+
+func (p *AccountPool) ClaimExternalRefreshTasks(workerID string, limit int, leaseSec int) []AccountUploadRequest {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return nil
+	}
+	limit = normalizeExternalClaimLimit(limit)
+	leaseSec = normalizeExternalLeaseSec(leaseSec)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	_, _, _, _, _, _, _, throttled := p.externalMetricsLocked()
+	if throttled && limit > 1 {
+		limit = 1
+	}
+
+	now := time.Now()
+	leaseUntil := now.Add(time.Duration(leaseSec) * time.Second)
+	tasks := make([]AccountUploadRequest, 0, limit)
+
+	for _, acc := range p.pendingAccounts {
+		acc.Mu.Lock()
+		if acc.Status != StatusPendingExternal {
+			acc.Mu.Unlock()
+			continue
+		}
+
+		// 回收过期租约
+		if acc.ExternalTaskID != "" && !acc.ExternalLeaseUntil.IsZero() && now.After(acc.ExternalLeaseUntil) {
+			acc.ExternalTaskID = ""
+			acc.ExternalLeaseOwner = ""
+			acc.ExternalLeaseUntil = time.Time{}
+			atomic.AddInt64(&p.externalRefreshLeaseExpired, 1)
+		}
+
+		// 已被其他 worker 持有
+		if acc.ExternalTaskID != "" && !acc.ExternalLeaseUntil.IsZero() && now.Before(acc.ExternalLeaseUntil) {
+			acc.Mu.Unlock()
+			continue
+		}
+
+		// 退避期间不发任务
+		if !acc.ExternalRetryAt.IsZero() && now.Before(acc.ExternalRetryAt) {
+			acc.Mu.Unlock()
+			continue
+		}
+
+		taskID := fmt.Sprintf("ext-refresh-%d", atomic.AddUint64(&p.externalTaskSeq, 1))
+		acc.ExternalTaskID = taskID
+		acc.ExternalLeaseOwner = workerID
+		acc.ExternalLeaseUntil = leaseUntil
+
+		cookieString := strings.TrimSpace(acc.Data.CookieString)
+		if cookieString == "" {
+			cookieString = BuildCookieString(acc.Data.Cookies)
+		}
+
+		task := AccountUploadRequest{
+			Email:         acc.Data.Email,
+			FullName:      acc.Data.FullName,
+			MailProvider:  acc.Data.MailProvider,
+			MailPassword:  acc.Data.MailPassword,
+			Cookies:       append([]Cookie(nil), acc.Data.Cookies...),
+			CookieString:  cookieString,
+			Authorization: acc.Data.Authorization,
+			ConfigID:      acc.Data.ConfigID,
+			CSESIDX:       acc.Data.CSESIDX,
+			IsNew:         false,
+			TaskID:        taskID,
+			WorkerID:      workerID,
+			LeaseUntil:    leaseUntil.Format(time.RFC3339),
+		}
+		acc.Mu.Unlock()
+
+		tasks = append(tasks, task)
+		if len(tasks) >= limit {
+			break
+		}
+	}
+
+	if len(tasks) > 0 {
+		atomic.AddInt64(&p.externalRefreshClaimTotal, int64(len(tasks)))
+	}
+	p.updateExternalAlertStateLocked()
+	return tasks
+}
+
+func (p *AccountPool) MarkExternalRefreshFailed(taskID, workerID, errMsg string) error {
+	taskID = strings.TrimSpace(taskID)
+	workerID = strings.TrimSpace(workerID)
+	if taskID == "" {
+		return fmt.Errorf("task_id 不能为空")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	acc := p.externalTaskByIDLocked(taskID)
+	if acc == nil {
+		return fmt.Errorf("task_id 不存在或已完成")
+	}
+
+	acc.Mu.Lock()
+	defer acc.Mu.Unlock()
+
+	if workerID != "" && acc.ExternalLeaseOwner != "" && acc.ExternalLeaseOwner != workerID {
+		return fmt.Errorf("task_id 归属不匹配")
+	}
+
+	acc.ExternalFailCount++
+	backoff := externalTaskBackoff(acc.ExternalFailCount)
+	acc.ExternalRetryAt = time.Now().Add(backoff)
+	acc.ExternalTaskID = ""
+	acc.ExternalLeaseOwner = ""
+	acc.ExternalLeaseUntil = time.Time{}
+	atomic.AddInt64(&p.externalRefreshFailedTotal, 1)
+
+	if strings.TrimSpace(errMsg) != "" {
+		logger.Warn("外部续期失败: email=%s fail_count=%d backoff=%s error=%s", acc.Data.Email, acc.ExternalFailCount, backoff, strings.TrimSpace(errMsg))
+	}
+	p.updateExternalAlertStateLocked()
+	return nil
+}
+
+func (p *AccountPool) ExternalRefreshThrottleState() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, _, _, _, _, _, _, throttled := p.externalMetricsLocked()
+	return throttled
+}
+
+func (p *AccountPool) CollectExternalRefreshMetrics() map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	claimTotal, successTotal, failedTotal, leaseExpiredTotal, fallbackTotal, successRate, fallbackRatio, throttled := p.externalMetricsLocked()
+	completed := successTotal + failedTotal
+	failRatio := float64(0)
+	if completed > 0 {
+		failRatio = float64(failedTotal) / float64(completed)
+	}
+
+	return map[string]interface{}{
+		"refresh_claim_total":         claimTotal,
+		"refresh_success_total":       successTotal,
+		"refresh_failed_total":        failedTotal,
+		"refresh_lease_expired_total": leaseExpiredTotal,
+		"fallback_total":              fallbackTotal,
+		"refresh_success_rate":        successRate,
+		"refresh_fail_ratio":          failRatio,
+		"fallback_ratio":              fallbackRatio,
+		"sample_size":                 completed,
+		"throttled":                   throttled,
+	}
 }
 
 func (p *AccountPool) Count() int { p.mu.RLock(); defer p.mu.RUnlock(); return len(p.readyAccounts) }
@@ -976,6 +1262,9 @@ func (p *AccountPool) Stats() map[string]interface{} {
 		acc.Mu.Unlock()
 	}
 
+	claimTotal, refreshSuccessTotal, refreshFailedTotal, leaseExpiredTotal, fallbackTotal, refreshSuccessRate, fallbackRatio, throttled := p.externalMetricsLocked()
+	refreshSampleSize := refreshSuccessTotal + refreshFailedTotal
+
 	return map[string]interface{}{
 		"ready":            len(p.readyAccounts),
 		"pending":          len(p.pendingAccounts),
@@ -991,6 +1280,17 @@ func (p *AccountPool) Stats() map[string]interface{} {
 		"cooldowns": map[string]interface{}{
 			"refresh_sec": int(RefreshCooldown.Seconds()),
 			"use_sec":     int(UseCooldown.Seconds()),
+		},
+		"registrar_metrics": map[string]interface{}{
+			"refresh_claim_total":         claimTotal,
+			"refresh_success_total":       refreshSuccessTotal,
+			"refresh_failed_total":        refreshFailedTotal,
+			"refresh_lease_expired_total": leaseExpiredTotal,
+			"fallback_total":              fallbackTotal,
+			"refresh_success_rate":        refreshSuccessRate,
+			"fallback_ratio":              fallbackRatio,
+			"sample_size":                 refreshSampleSize,
+			"throttled":                   throttled,
 		},
 	}
 }

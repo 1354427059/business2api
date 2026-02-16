@@ -53,6 +53,10 @@
     statPendingExternal: document.getElementById("statPendingExternal"),
     statInvalid: document.getElementById("statInvalid"),
     statAvailableToday: document.getElementById("statAvailableToday"),
+    statRegistrarSuccessRate: document.getElementById("statRegistrarSuccessRate"),
+    statRegistrarFallbackRatio: document.getElementById("statRegistrarFallbackRatio"),
+    statRegistrarSampleSize: document.getElementById("statRegistrarSampleSize"),
+    statRegistrarThrottled: document.getElementById("statRegistrarThrottled"),
 
     actionLog: document.getElementById("actionLog"),
     reloadPoolBtn: document.getElementById("reloadPoolBtn"),
@@ -150,6 +154,11 @@
     if (value < 1024) return `${value} B`;
     if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
     return `${(value / (1024 * 1024)).toFixed(2)} MB`;
+  }
+
+  function formatRatio(value) {
+    if (!Number.isFinite(value)) return "-";
+    return `${(value * 100).toFixed(1)}%`;
   }
 
   function statusTag(status) {
@@ -333,6 +342,21 @@
     els.statInvalid.textContent = status.invalid ?? "0";
     els.statAvailableToday.textContent = status.available_today ?? "-";
     return status;
+  }
+
+  async function loadRegistrarMetrics() {
+    const metrics = await panelFetch("/admin/registrar/metrics");
+    const successRate = Number(metrics.refresh_success_rate);
+    const fallbackRatio = Number(metrics.fallback_ratio);
+    const sampleSize = Number(metrics.sample_size);
+    const throttled = Boolean(metrics.throttled);
+
+    els.statRegistrarSuccessRate.textContent = formatRatio(successRate);
+    els.statRegistrarFallbackRatio.textContent = formatRatio(fallbackRatio);
+    els.statRegistrarSampleSize.textContent = Number.isFinite(sampleSize) ? String(sampleSize) : "-";
+    els.statRegistrarThrottled.textContent = throttled ? "ON" : "OFF";
+    els.statRegistrarThrottled.style.color = throttled ? "#c52f2f" : "#1e8f45";
+    return metrics;
   }
 
   async function loadAccounts() {
@@ -658,7 +682,7 @@
   }
 
   async function refreshAll() {
-    const results = await Promise.allSettled([loadStatus(), loadAccounts(), loadFiles(), loadModels()]);
+    const results = await Promise.allSettled([loadStatus(), loadRegistrarMetrics(), loadAccounts(), loadFiles(), loadModels()]);
     const failed = results.filter((item) => item.status === "rejected");
     if (failed.length) {
       const reason = failed.map((item) => item.reason?.message || String(item.reason)).join("\n");

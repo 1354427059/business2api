@@ -400,6 +400,167 @@ func TestRegistrarTriggerRegisterProxyAndErrorPassthrough(t *testing.T) {
 	})
 }
 
+func TestRegistrarRefreshTaskClaimFailAndMetrics(t *testing.T) {
+	r, dir, restore := newAdminTestRouter(t)
+	defer restore()
+
+	writeAccountFile(t, dir, makeAccount("claim@example.com", "cfg-claim", "6606", "Bearer claim"))
+	if err := pool.Pool.Load(dir); err != nil {
+		t.Fatalf("load pool before claim: %v", err)
+	}
+	pool.Pool.WithWriteLock(func(ready, pending []*pool.Account) ([]*pool.Account, []*pool.Account) {
+		for _, acc := range pending {
+			if acc.Data.Email == "claim@example.com" {
+				acc.Status = pool.StatusPendingExternal
+			}
+		}
+		return ready, pending
+	})
+
+	claimResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/refresh-tasks/claim", `{"worker_id":"worker-1","limit":5,"lease_sec":120}`)
+	if claimResp.Code != http.StatusOK {
+		t.Fatalf("claim status=%d body=%s", claimResp.Code, claimResp.Body.String())
+	}
+	claimBody := decodeJSONBody(t, claimResp.Body.String())
+	if int(claimBody["count"].(float64)) != 1 {
+		t.Fatalf("expected claim count=1, body=%s", claimResp.Body.String())
+	}
+	tasks, ok := claimBody["tasks"].([]interface{})
+	if !ok || len(tasks) != 1 {
+		t.Fatalf("expected 1 task, body=%s", claimResp.Body.String())
+	}
+	taskMap := tasks[0].(map[string]interface{})
+	taskID, _ := taskMap["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("task_id should not be empty, body=%s", claimResp.Body.String())
+	}
+	if leaseUntil, _ := taskMap["lease_until"].(string); leaseUntil == "" {
+		t.Fatalf("lease_until should not be empty, body=%s", claimResp.Body.String())
+	}
+
+	claimAgainResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/refresh-tasks/claim", `{"worker_id":"worker-2","limit":5}`)
+	if claimAgainResp.Code != http.StatusOK {
+		t.Fatalf("claim again status=%d body=%s", claimAgainResp.Code, claimAgainResp.Body.String())
+	}
+	claimAgainBody := decodeJSONBody(t, claimAgainResp.Body.String())
+	if int(claimAgainBody["count"].(float64)) != 0 {
+		t.Fatalf("expected claim count=0 after lease, body=%s", claimAgainResp.Body.String())
+	}
+
+	failWrongResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/refresh-tasks/fail", fmt.Sprintf(`{"task_id":"%s","worker_id":"worker-2","error":"boom"}`, taskID))
+	if failWrongResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected fail wrong worker 400, got %d body=%s", failWrongResp.Code, failWrongResp.Body.String())
+	}
+
+	failResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/refresh-tasks/fail", fmt.Sprintf(`{"task_id":"%s","worker_id":"worker-1","error":"boom"}`, taskID))
+	if failResp.Code != http.StatusOK {
+		t.Fatalf("fail status=%d body=%s", failResp.Code, failResp.Body.String())
+	}
+
+	metricsResp := doAuthedJSONRequest(t, r, http.MethodGet, "/admin/registrar/metrics", "")
+	if metricsResp.Code != http.StatusOK {
+		t.Fatalf("metrics status=%d body=%s", metricsResp.Code, metricsResp.Body.String())
+	}
+	metricsBody := decodeJSONBody(t, metricsResp.Body.String())
+	if int(metricsBody["refresh_claim_total"].(float64)) < 1 {
+		t.Fatalf("expected refresh_claim_total >= 1, body=%s", metricsResp.Body.String())
+	}
+	if int(metricsBody["refresh_failed_total"].(float64)) < 1 {
+		t.Fatalf("expected refresh_failed_total >= 1, body=%s", metricsResp.Body.String())
+	}
+	if _, ok := metricsBody["refresh_success_rate"]; !ok {
+		t.Fatalf("expected refresh_success_rate in metrics, body=%s", metricsResp.Body.String())
+	}
+	if _, ok := metricsBody["fallback_ratio"]; !ok {
+		t.Fatalf("expected fallback_ratio in metrics, body=%s", metricsResp.Body.String())
+	}
+	if _, ok := metricsBody["throttled"]; !ok {
+		t.Fatalf("expected throttled in metrics, body=%s", metricsResp.Body.String())
+	}
+}
+
+func TestRegistrarRefreshTaskClaimValidation(t *testing.T) {
+	r, _, restore := newAdminTestRouter(t)
+	defer restore()
+
+	missingWorkerResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/refresh-tasks/claim", `{"limit":2}`)
+	if missingWorkerResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing worker_id, got %d body=%s", missingWorkerResp.Code, missingWorkerResp.Body.String())
+	}
+
+	invalidJSONResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/refresh-tasks/claim", `{"worker_id":`)
+	if invalidJSONResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid json, got %d body=%s", invalidJSONResp.Code, invalidJSONResp.Body.String())
+	}
+}
+
+func TestRegistrarUploadAccountTaskOwnership(t *testing.T) {
+	r, dir, restore := newAdminTestRouter(t)
+	defer restore()
+
+	writeAccountFile(t, dir, makeAccount("owner@example.com", "cfg-owner", "7707", "Bearer owner"))
+	if err := pool.Pool.Load(dir); err != nil {
+		t.Fatalf("load pool before ownership: %v", err)
+	}
+	pool.Pool.WithWriteLock(func(ready, pending []*pool.Account) ([]*pool.Account, []*pool.Account) {
+		for _, acc := range pending {
+			if acc.Data.Email == "owner@example.com" {
+				acc.Status = pool.StatusPendingExternal
+			}
+		}
+		return ready, pending
+	})
+
+	claimResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/refresh-tasks/claim", `{"worker_id":"owner-worker","limit":1}`)
+	if claimResp.Code != http.StatusOK {
+		t.Fatalf("claim status=%d body=%s", claimResp.Code, claimResp.Body.String())
+	}
+	claimBody := decodeJSONBody(t, claimResp.Body.String())
+	tasks := claimBody["tasks"].([]interface{})
+	taskID := tasks[0].(map[string]interface{})["task_id"].(string)
+
+	badUpload := fmt.Sprintf(`{
+		"email":"owner@example.com",
+		"full_name":"Tester",
+		"mail_provider":"chatgpt",
+		"mail_password":"",
+		"cookies":[{"name":"__Secure-C_SES","value":"cookie-value","domain":".gemini.google"}],
+		"cookie_string":"__Secure-C_SES=cookie-value",
+		"authorization":"Bearer owner-new",
+		"authorization_source":"network",
+		"config_id":"cfg-owner-new",
+		"csesidx":"7708",
+		"is_new":false,
+		"task_id":"%s",
+		"worker_id":"other-worker"
+	}`, taskID)
+	badResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/upload-account", badUpload)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad upload 400, got %d body=%s", badResp.Code, badResp.Body.String())
+	}
+
+	goodUpload := fmt.Sprintf(`{
+		"email":"owner@example.com",
+		"full_name":"Tester",
+		"mail_provider":"chatgpt",
+		"mail_password":"",
+		"cookies":[{"name":"__Secure-C_SES","value":"cookie-value","domain":".gemini.google"}],
+		"cookie_string":"__Secure-C_SES=cookie-value",
+		"authorization":"Bearer owner-new",
+		"authorization_source":"fallback",
+		"fallback_used":true,
+		"config_id":"cfg-owner-new",
+		"csesidx":"7708",
+		"is_new":false,
+		"task_id":"%s",
+		"worker_id":"owner-worker"
+	}`, taskID)
+	goodResp := doAuthedJSONRequest(t, r, http.MethodPost, "/admin/registrar/upload-account", goodUpload)
+	if goodResp.Code != http.StatusOK {
+		t.Fatalf("expected good upload 200, got %d body=%s", goodResp.Code, goodResp.Body.String())
+	}
+}
+
 func TestPoolFilesImportSingleJSON(t *testing.T) {
 	r, _, restore := newAdminTestRouter(t)
 	defer restore()

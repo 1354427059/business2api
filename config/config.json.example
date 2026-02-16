@@ -1,5 +1,5 @@
 {
-  "api_keys": ["your-api-key-here"],
+  "api_keys": [],
   "listen_addr": ":8000",
   "data_dir": "./data",
   "default_config": "",
@@ -28,7 +28,7 @@
     "mode": "local",
     "server_addr": "http://server-ip:8000",
     "listen_addr": ":8000",
-    "secret": "your-secret-key",
+    "secret": "",
     "target_count": 50,
     "client_threads": 2,
     "data_dir": "./data",

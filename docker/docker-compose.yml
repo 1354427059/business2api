@@ -17,7 +17,9 @@ services:
       - TZ=Asia/Shanghai
       - LISTEN_ADDR=:8000
       - DATA_DIR=/app/data
-      # - API_KEY=your-api-key
+      - API_KEYS=${API_KEYS:-}
+      - POOL_SERVER_SECRET=${POOL_SERVER_SECRET:-}
+      - DUCKMAIL_BEARER=${DUCKMAIL_BEARER:-}
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/health"]
       interval: 30s
@@ -46,15 +48,18 @@ services:
       - APP_PORT=8090
       - LOG_LEVEL=INFO
       - B2A_BASE_URL=http://business2api:8000
-      - B2A_API_KEY=sk-local-test-key-123456
+      - B2A_API_KEY=${B2A_API_KEY:-}
       - MAIL_API=https://mail.chatgpt.org.uk
-      - MAIL_KEY=gpt-test
+      - MAIL_KEY=${MAIL_KEY:-}
       - SELENIUM_REMOTE_URL=http://selenium:4444/wd/hub
       - HEADLESS=${REGISTRAR_HEADLESS:-false}
       - ENABLE_AUTO_REGISTER=true
       - ENABLE_AUTO_REFRESH=true
       - REGISTER_MAX_WORKERS=1
       - REFRESH_BATCH_LIMIT=20
+      - REFRESH_TASK_LEASE_SEC=${REFRESH_TASK_LEASE_SEC:-180}
+      - CREDENTIALS_WAIT_TIMEOUT_SEC=${CREDENTIALS_WAIT_TIMEOUT_SEC:-40}
+      - WORKER_ID=${REGISTRAR_WORKER_ID:-}
       - REGISTER_INTERVAL_SEC=30
       - REFRESH_INTERVAL_SEC=20
       - ARTIFACTS_DIR=/tmp/registrar-artifacts

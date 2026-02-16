@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -586,6 +587,7 @@ func reloadConfig() error {
 	if err := json.Unmarshal(data, &newConfig); err != nil {
 		return fmt.Errorf("解析配置文件失败: %w", err)
 	}
+	applySensitiveEnvOverrides(&newConfig)
 
 	configMu.Lock()
 	oldAPIKeys := appConfig.APIKeys
@@ -889,9 +891,7 @@ func loadAppConfig() {
 	if v := os.Getenv("CONFIG_ID"); v != "" {
 		appConfig.DefaultConfig = v
 	}
-	if v := os.Getenv("API_KEY"); v != "" {
-		appConfig.APIKeys = append(appConfig.APIKeys, v)
-	}
+	applySensitiveEnvOverrides(&appConfig)
 
 	// 设置全局变量
 	DataDir = appConfig.DataDir
@@ -1172,6 +1172,56 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func normalizeAPIKeys(keys []string) []string {
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
+}
+
+func applySensitiveEnvOverrides(cfg *AppConfig) {
+	if cfg == nil {
+		return
+	}
+	if v := strings.TrimSpace(os.Getenv("API_KEYS")); v != "" {
+		cfg.APIKeys = splitCSV(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("API_KEY")); v != "" {
+		cfg.APIKeys = append(cfg.APIKeys, v)
+	}
+	cfg.APIKeys = normalizeAPIKeys(cfg.APIKeys)
+
+	if v := strings.TrimSpace(os.Getenv("POOL_SERVER_SECRET")); v != "" {
+		cfg.PoolServer.Secret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("DUCKMAIL_BEARER")); v != "" {
+		cfg.Pool.DuckMailBearer = v
+	}
 }
 
 func getCommonHeaders(jwt, origAuth string) map[string]string {
@@ -2537,7 +2587,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			logger.Error("❌ [%s] 创建 Session 失败: %v", acc.Data.Email, err)
 			// 401 错误标记账号需要刷新
 			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
-				//		pool.Pool.MarkNeedsRefresh(acc)
+				pool.Pool.MarkNeedsRefresh(acc)
 			}
 			lastErr = err
 			continue
@@ -3374,6 +3424,25 @@ func runBrowserRefreshMode(email string) {
 
 var AutoSubscribeEnabled bool
 
+var (
+	bearerSecretRE   = regexp.MustCompile(`(?i)(authorization[^A-Za-z0-9]+Bearer[ \t]+)[A-Za-z0-9\-._~+/=]+`)
+	xPoolSecretRE    = regexp.MustCompile(`(?i)(x-pool-secret[^A-Za-z0-9]+)[^\s",;]+`)
+	apiKeyTokenRE    = regexp.MustCompile(`(?i)\bsk-[A-Za-z0-9\-_]{8,}\b`)
+	duckmailBearerRE = regexp.MustCompile(`(?i)(duckmail[_-]?bearer[^A-Za-z0-9]+)[^\s",;]+`)
+)
+
+func sanitizeSensitiveLine(line string) string {
+	clean := strings.TrimSpace(line)
+	if clean == "" {
+		return ""
+	}
+	clean = bearerSecretRE.ReplaceAllString(clean, "${1}***")
+	clean = xPoolSecretRE.ReplaceAllString(clean, "${1}***")
+	clean = duckmailBearerRE.ReplaceAllString(clean, "${1}***")
+	clean = apiKeyTokenRE.ReplaceAllString(clean, "sk-***")
+	return clean
+}
+
 func init() {
 	// 设置环境变量禁用 quic-go 的警告
 	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
@@ -3408,8 +3477,12 @@ func filterStdout() {
 				continue
 			}
 
-			_, _ = origStdout.WriteString(line + "\n")
-			logger.AppendRaw("business2api", line)
+			safeLine := sanitizeSensitiveLine(line)
+			if safeLine == "" {
+				continue
+			}
+			_, _ = origStdout.WriteString(safeLine + "\n")
+			logger.AppendRaw("business2api", safeLine)
 		}
 	}()
 }
@@ -5009,9 +5082,64 @@ func setupAPIRoutes(r *gin.Engine) {
 
 		tasks := pool.Pool.ExternalRefreshTasks(limit)
 		c.JSON(200, gin.H{
-			"tasks": tasks,
-			"count": len(tasks),
+			"tasks":      tasks,
+			"count":      len(tasks),
+			"deprecated": true,
 		})
+	})
+
+	admin.POST("/registrar/refresh-tasks/claim", func(c *gin.Context) {
+		var req struct {
+			WorkerID string `json:"worker_id"`
+			Limit    int    `json:"limit"`
+			LeaseSec int    `json:"lease_sec"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		req.WorkerID = strings.TrimSpace(req.WorkerID)
+		if req.WorkerID == "" {
+			c.JSON(400, gin.H{"error": "worker_id 不能为空"})
+			return
+		}
+
+		tasks := pool.Pool.ClaimExternalRefreshTasks(req.WorkerID, req.Limit, req.LeaseSec)
+		metrics := pool.Pool.CollectExternalRefreshMetrics()
+		throttled, _ := metrics["throttled"].(bool)
+
+		c.JSON(200, gin.H{
+			"tasks":      tasks,
+			"count":      len(tasks),
+			"throttled":  throttled,
+			"deprecated": false,
+		})
+	})
+
+	admin.POST("/registrar/refresh-tasks/fail", func(c *gin.Context) {
+		var req struct {
+			TaskID   string `json:"task_id"`
+			WorkerID string `json:"worker_id"`
+			Error    string `json:"error"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		if err := pool.Pool.MarkExternalRefreshFailed(req.TaskID, req.WorkerID, req.Error); err != nil {
+			c.JSON(400, gin.H{"success": false, "error": err.Error()})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"success": true,
+			"task_id": strings.TrimSpace(req.TaskID),
+		})
+	})
+
+	admin.GET("/registrar/metrics", func(c *gin.Context) {
+		c.JSON(200, pool.Pool.CollectExternalRefreshMetrics())
 	})
 
 	admin.POST("/refresh", func(c *gin.Context) {

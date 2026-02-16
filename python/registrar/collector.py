@@ -2,7 +2,7 @@ import base64
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ def extract_csesidx_from_authorization(auth_header: str) -> str:
 
 def collect_authorization_and_ids(driver: Any) -> Dict[str, str]:
 	auth_header = ""
+	authorization_source = ""
 	config_id = ""
 	csesidx = ""
 
@@ -83,7 +84,10 @@ def collect_authorization_and_ids(driver: Any) -> Dict[str, str]:
 			else:
 				continue
 			if not auth_header:
-				auth_header = str(headers.get("authorization") or headers.get("Authorization") or "")
+				candidate_auth = str(headers.get("authorization") or headers.get("Authorization") or "").strip()
+				if candidate_auth:
+					auth_header = candidate_auth
+					authorization_source = "network"
 			if url:
 				if not config_id:
 					config_id = extract_config_id(url)
@@ -120,6 +124,7 @@ return '';
 			)
 			if isinstance(storage_auth, str) and storage_auth.strip():
 				auth_header = storage_auth.strip()
+				authorization_source = "storage"
 		except Exception:
 			pass
 	if not auth_header:
@@ -128,17 +133,20 @@ return '';
 			match = _PAGE_AUTH_RE.search(source)
 			if match:
 				auth_header = match.group(1).strip()
+				authorization_source = "page"
 		except Exception:
 			pass
 	if not auth_header and current_url:
 		match = _URL_AUTH_RE.search(current_url)
 		if match:
 			auth_header = match.group(1).strip()
+			authorization_source = "url"
 	if not csesidx and auth_header:
 		csesidx = extract_csesidx_from_authorization(auth_header)
 
 	return {
 		"authorization": auth_header.strip(),
+		"authorization_source": authorization_source.strip(),
 		"config_id": config_id.strip(),
 		"csesidx": csesidx.strip(),
 		"current_url": current_url.strip(),
@@ -185,10 +193,17 @@ def build_upload_payload(
 	cookies = collect_cookies(driver)
 	cookie_string = build_cookie_string(cookies)
 	authorization = snapshot.get("authorization", "").strip()
+	authorization_source = snapshot.get("authorization_source", "").strip()
+	config_id = snapshot.get("config_id", "").strip()
 	csesidx = snapshot.get("csesidx", "").strip()
-	if not authorization and csesidx:
+	fallback_used = False
+	if not authorization and config_id and csesidx:
 		authorization = f"Bearer fallback-csesidx-{csesidx}"
+		authorization_source = "fallback"
+		fallback_used = True
 		logger.warning("authorization 缺失，使用 fallback 令牌: email=%s", email)
+	elif authorization and not authorization_source:
+		authorization_source = "network"
 
 	payload = {
 		"email": email,
@@ -198,7 +213,9 @@ def build_upload_payload(
 		"cookies": cookies,
 		"cookie_string": cookie_string,
 		"authorization": authorization,
-		"config_id": snapshot.get("config_id", ""),
+		"authorization_source": authorization_source,
+		"fallback_used": fallback_used,
+		"config_id": config_id,
 		"csesidx": csesidx,
 		"is_new": is_new,
 	}
@@ -216,5 +233,12 @@ def validate_payload(payload: Dict[str, Any]) -> None:
 			continue
 		if not isinstance(value, str) or not value.strip():
 			raise ValueError(f"payload 缺少 {key}")
+	source = str(payload.get("authorization_source", "")).strip().lower()
+	if not source:
+		raise ValueError("payload 缺少 authorization_source")
+	if source not in {"network", "storage", "page", "url", "fallback"}:
+		raise ValueError(f"payload authorization_source 无效: {source}")
+	if payload.get("fallback_used") and source != "fallback":
+		raise ValueError("payload fallback_used 与 authorization_source 不一致")
 	if payload.get("is_new") and not str(payload.get("full_name", "")).strip():
 		raise ValueError("payload 缺少 full_name（注册场景）")

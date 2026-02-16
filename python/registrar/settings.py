@@ -1,4 +1,5 @@
 import os
+import socket
 from dataclasses import dataclass
 
 
@@ -39,9 +40,17 @@ class Settings:
 	refresh_interval_sec: int
 	register_max_workers: int
 	refresh_batch_limit: int
+	refresh_task_lease_sec: int
+	credentials_wait_timeout_sec: int
+	worker_id: str
 
 	# 工件目录
 	artifacts_dir: str
+
+
+def _default_worker_id() -> str:
+	host = socket.gethostname().strip() or "worker"
+	return f"{host}-{os.getpid()}"
 
 
 def load_settings() -> Settings:
@@ -57,7 +66,7 @@ def load_settings() -> Settings:
 			"https://auth.business.gemini.google/login?continueUrl=https:%2F%2Fbusiness.gemini.google%2F&wiffid=CAoSJDIwNTlhYzBjLTVlMmMtNGUxZC1hY2JkLThmOGY2ZDE0ODM1Mg",
 		),
 		mail_api=os.getenv("MAIL_API", "https://mail.chatgpt.org.uk").rstrip("/"),
-		mail_key=os.getenv("MAIL_KEY", "gpt-test"),
+		mail_key=os.getenv("MAIL_KEY", "").strip(),
 		mail_poll_interval_sec=int(os.getenv("MAIL_POLL_INTERVAL_SEC", "3")),
 		mail_poll_timeout_sec=int(os.getenv("MAIL_POLL_TIMEOUT_SEC", "30")),
 		selenium_remote_url=os.getenv("SELENIUM_REMOTE_URL", "http://selenium:4444/wd/hub"),
@@ -68,5 +77,8 @@ def load_settings() -> Settings:
 		refresh_interval_sec=int(os.getenv("REFRESH_INTERVAL_SEC", "20")),
 		register_max_workers=int(os.getenv("REGISTER_MAX_WORKERS", "1")),
 		refresh_batch_limit=int(os.getenv("REFRESH_BATCH_LIMIT", "20")),
+		refresh_task_lease_sec=int(os.getenv("REFRESH_TASK_LEASE_SEC", "180")),
+		credentials_wait_timeout_sec=int(os.getenv("CREDENTIALS_WAIT_TIMEOUT_SEC", "40")),
+		worker_id=os.getenv("WORKER_ID", _default_worker_id()).strip() or _default_worker_id(),
 		artifacts_dir=os.getenv("ARTIFACTS_DIR", "/tmp/registrar-artifacts"),
 	)

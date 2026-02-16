@@ -1262,16 +1262,21 @@ func (rc *RemotePoolClient) RefreshJWT(email string) (*CachedAccount, error) {
 }
 
 type AccountUploadRequest struct {
-	Email         string   `json:"email"`
-	FullName      string   `json:"full_name"`
-	MailProvider  string   `json:"mail_provider,omitempty"`
-	MailPassword  string   `json:"mail_password,omitempty"`
-	Cookies       []Cookie `json:"cookies"`
-	CookieString  string   `json:"cookie_string"`
-	Authorization string   `json:"authorization"`
-	ConfigID      string   `json:"config_id"`
-	CSESIDX       string   `json:"csesidx"`
-	IsNew         bool     `json:"is_new"`
+	Email               string   `json:"email"`
+	FullName            string   `json:"full_name"`
+	MailProvider        string   `json:"mail_provider,omitempty"`
+	MailPassword        string   `json:"mail_password,omitempty"`
+	Cookies             []Cookie `json:"cookies"`
+	CookieString        string   `json:"cookie_string"`
+	Authorization       string   `json:"authorization"`
+	ConfigID            string   `json:"config_id"`
+	CSESIDX             string   `json:"csesidx"`
+	IsNew               bool     `json:"is_new"`
+	TaskID              string   `json:"task_id,omitempty"`
+	WorkerID            string   `json:"worker_id,omitempty"`
+	LeaseUntil          string   `json:"lease_until,omitempty"`
+	FallbackUsed        bool     `json:"fallback_used,omitempty"`
+	AuthorizationSource string   `json:"authorization_source,omitempty"`
 }
 
 var ErrInvalidAccountUpload = errors.New("invalid account upload request")
@@ -1289,6 +1294,10 @@ func normalizeAndValidateUploadRequest(req *AccountUploadRequest) error {
 	req.ConfigID = strings.TrimSpace(req.ConfigID)
 	req.CSESIDX = strings.TrimSpace(req.CSESIDX)
 	req.CookieString = strings.TrimSpace(req.CookieString)
+	req.TaskID = strings.TrimSpace(req.TaskID)
+	req.WorkerID = strings.TrimSpace(req.WorkerID)
+	req.LeaseUntil = strings.TrimSpace(req.LeaseUntil)
+	req.AuthorizationSource = strings.TrimSpace(req.AuthorizationSource)
 
 	if req.Email == "" {
 		return fmt.Errorf("%w: email 不能为空", ErrInvalidAccountUpload)
@@ -1307,6 +1316,9 @@ func normalizeAndValidateUploadRequest(req *AccountUploadRequest) error {
 	}
 	if req.CSESIDX == "" {
 		return fmt.Errorf("%w: csesidx 不能为空", ErrInvalidAccountUpload)
+	}
+	if req.TaskID != "" && req.IsNew {
+		return fmt.Errorf("%w: 注册场景不允许携带 task_id", ErrInvalidAccountUpload)
 	}
 	return nil
 }
@@ -1377,6 +1389,43 @@ func ProcessAccountUpload(accountPool *AccountPool, dataDir string, req *Account
 	accountPool.mu.Lock()
 	defer accountPool.mu.Unlock()
 
+	checkTaskOwnershipLocked := func(acc *Account) error {
+		if req.IsNew || req.TaskID == "" {
+			return nil
+		}
+		if acc.ExternalTaskID == "" {
+			return fmt.Errorf("%w: task_id 未分配或已失效", ErrInvalidAccountUpload)
+		}
+		if acc.ExternalTaskID != req.TaskID {
+			return fmt.Errorf("%w: task_id 不匹配", ErrInvalidAccountUpload)
+		}
+		if req.WorkerID != "" && acc.ExternalLeaseOwner != "" && acc.ExternalLeaseOwner != req.WorkerID {
+			return fmt.Errorf("%w: worker_id 不匹配", ErrInvalidAccountUpload)
+		}
+		if !acc.ExternalLeaseUntil.IsZero() && time.Now().After(acc.ExternalLeaseUntil) {
+			return fmt.Errorf("%w: task_id 已过期", ErrInvalidAccountUpload)
+		}
+		return nil
+	}
+
+	resetExternalTaskLocked := func(acc *Account) {
+		acc.ExternalTaskID = ""
+		acc.ExternalLeaseOwner = ""
+		acc.ExternalLeaseUntil = time.Time{}
+	}
+
+	recordRefreshSuccessLocked := func(acc *Account) {
+		if req.IsNew {
+			return
+		}
+		acc.ExternalFailCount = 0
+		acc.ExternalRetryAt = time.Time{}
+		atomic.AddInt64(&accountPool.externalRefreshSuccessTotal, 1)
+		if req.FallbackUsed {
+			atomic.AddInt64(&accountPool.externalRefreshFallbackTotal, 1)
+		}
+	}
+
 	foundInPending := -1
 	for i, acc := range accountPool.pendingAccounts {
 		if acc.Data.Email == req.Email {
@@ -1388,6 +1437,10 @@ func ProcessAccountUpload(accountPool *AccountPool, dataDir string, req *Account
 	if foundInPending >= 0 {
 		acc := accountPool.pendingAccounts[foundInPending]
 		acc.Mu.Lock()
+		if err := checkTaskOwnershipLocked(acc); err != nil {
+			acc.Mu.Unlock()
+			return err
+		}
 		acc.Data = accData
 		acc.ConfigID = req.ConfigID
 		acc.CSESIDX = req.CSESIDX
@@ -1396,7 +1449,10 @@ func ProcessAccountUpload(accountPool *AccountPool, dataDir string, req *Account
 		acc.JWTExpires = time.Time{}
 		acc.Refreshed = false
 		acc.Status = StatusPending
+		recordRefreshSuccessLocked(acc)
+		resetExternalTaskLocked(acc)
 		acc.Mu.Unlock()
+		accountPool.updateExternalAlertStateLocked()
 		return nil
 	}
 
@@ -1411,6 +1467,10 @@ func ProcessAccountUpload(accountPool *AccountPool, dataDir string, req *Account
 	if foundInReady >= 0 {
 		acc := accountPool.readyAccounts[foundInReady]
 		acc.Mu.Lock()
+		if err := checkTaskOwnershipLocked(acc); err != nil {
+			acc.Mu.Unlock()
+			return err
+		}
 		acc.Data = accData
 		acc.ConfigID = req.ConfigID
 		acc.CSESIDX = req.CSESIDX
@@ -1419,11 +1479,18 @@ func ProcessAccountUpload(accountPool *AccountPool, dataDir string, req *Account
 		acc.JWTExpires = time.Time{}
 		acc.Refreshed = false
 		acc.Status = StatusPending
+		recordRefreshSuccessLocked(acc)
+		resetExternalTaskLocked(acc)
 		acc.Mu.Unlock()
 
 		accountPool.readyAccounts = append(accountPool.readyAccounts[:foundInReady], accountPool.readyAccounts[foundInReady+1:]...)
 		accountPool.pendingAccounts = append(accountPool.pendingAccounts, acc)
+		accountPool.updateExternalAlertStateLocked()
 		return nil
+	}
+
+	if !req.IsNew && req.TaskID != "" {
+		return fmt.Errorf("%w: task_id 对应账号不存在", ErrInvalidAccountUpload)
 	}
 
 	logger.Warn("⚠️ [%s] 账号已保存但未在内存中找到", req.Email)

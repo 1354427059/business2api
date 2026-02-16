@@ -1,393 +1,292 @@
 # Business2API
 
-> 🚀 OpenAI/Gemini 兼容的 Gemini Business API 代理服务，支持账号池管理、自动注册和 Flow 图片/视频生成。
+> OpenAI / Gemini / Claude 兼容的 Gemini Business API 代理服务，支持账号池管理、自动注册、Flow 图片/视频生成、管理面板与外部 registrar 续期闭环。
 
 [![Build](https://github.com/XxxXTeam/business2api/actions/workflows/build.yml/badge.svg)](https://github.com/XxxXTeam/business2api/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://golang.org)
 
-## ✨ 功能特性
+## 项目运行流程（已按当前代码校准）
 
-| 功能 | 描述 |
-|------|------|
-| 🔌 **多 API 兼容** | OpenAI (`/v1/chat/completions`)、Gemini (`/v1beta/models`)、Claude (`/v1/messages`) |
-| 🏊 **智能账号池** | 自动轮询、刷新、冷却管理、401/403 自动换号 |
-| 🌊 **流式响应** | SSE 流式输出，支持 `stream: true` |
-| 🎨 **多模态** | 图片/视频输入、原生图片生成（`-image` 后缀）|
-| 🤖 **自动注册** | 浏览器自动化注册，支持 Windows/Linux/macOS |
-| 🌐 **代理池** | HTTP/SOCKS5 代理，订阅链接，健康检查 |
-| 📊 **遥测监控** | IP 请求统计、Token 使用量、RPM 监控 |
-| 🔄 **热重载** | 配置文件自动监听，无需重启 |
+当前程序入口位于 `main.go`，实际启动逻辑如下：
 
-## 📦 支持的模型
+1. 加载 `config/config.json`（不存在时自动创建默认配置）
+2. 应用环境变量覆盖（例如 `API_KEYS`、`POOL_SERVER_SECRET`）
+3. 按 `pool_server.mode` 进入运行模式：
+   - `local`：API 服务 + 本地账号池（默认）
+   - `server`：API 服务 + 号池调度中心 + WS 任务分发
+   - `client`：仅作为工作节点连接 server，不提供 API
+4. 若开启 `flow.enable=true`，初始化 Flow Token 池（`data/at/*.txt`）
+5. 若配置了 API Key，则 `/v1/*` 与 `/admin/*` 开启鉴权
 
-### Gemini Business 模型
+## 功能特性
 
-| 模型 | 文本 | 图片生成 | 视频生成 | 搜索 |
-|------|:----:|:--------:|:--------:|:----:|
-| gemini-2.5-flash | ✅ | ✅ | ✅ | ✅ |
-| gemini-2.5-pro | ✅ | ✅ | ✅ | ✅ |
-| gemini-2.5-flash-preview-latest | ✅ | ✅ | ✅ | ✅ |
-| gemini-3-pro-preview | ✅ | ✅ | ✅ | ✅ |
-| gemini-3-flash-preview | ✅ | ✅ | ✅ | ✅ |
-| gemini-3-flash | ✅ | ✅ | ✅ | ✅ |
+- 多协议兼容：
+  - OpenAI：`/v1/chat/completions`、`/v1/models`
+  - Claude：`/v1/messages`
+  - Gemini：`/v1beta/models`、`/v1beta/models/*action`
+- 账号池能力：自动注册、轮询调度、401/403 处理、冷却控制
+- 外部续期闭环：支持 Python registrar claim/fail/metrics
+- Flow 生成：图片与视频模型（含 T2V / I2V / R2V）
+- 管理面板：账号/文件管理、日志流、在线测试
+- 配置热重载：监听 `config/config.json`
+- 代理池：订阅 + 文件源 + 健康检查
 
-### 功能后缀
+## 支持模型
 
-支持单个或混合后缀启用指定功能：
+### 基础模型（始终可见）
 
-| 后缀 | 功能 | 示例 |
-|------|------|------|
-| `-image` | 图片生成 | `gemini-2.5-flash-image` |
-| `-video` | 视频生成 | `gemini-2.5-flash-video` |
-| `-search` | 联网搜索 | `gemini-2.5-flash-search` |
-| 混合后缀 | 同时启用多功能 | `gemini-2.5-flash-image-search` |
+- `gemini-2.5-flash`
+- `gemini-2.5-pro`
+- `gemini-3-pro-preview`
+- `gemini-3-pro`
+- `gemini-3-flash-preview`
+- `gemini-3-flash`
+- `gemini-2.5-flash-preview-latest`
 
-**说明：**
-- 无后缀：启用所有功能（图片/视频/搜索/工具）
-- 有后缀：只启用指定功能，支持任意组合如 `-image-search`、`-video-search`
+### 功能后缀模型（基础模型扩展）
 
-### ⚠️ 限制说明
+- `-image`：图片生成
+- `-video`：视频生成
+- `-search`：联网搜索
+- 支持混合后缀：如 `gemini-2.5-flash-image-search`
 
-| 限制 | 说明 |
-|------|------|
-| **不支持自定义工具** | Function Calling / Tools 参数会被忽略，仅支持内置工具（图片/视频生成、搜索） |
-| **上下文拼接实现** | 多轮对话通过拼接 `messages` 为单次请求实现，非原生会话管理 |
-| **无状态** | 每次请求独立，不保留会话状态，历史消息需客户端自行维护 |
+说明：代码支持无后缀和后缀模型并存；后缀会触发对应工具能力。
 
----
+### Flow 模型（仅在 `flow.enable=true` 时可见）
 
-
->> 公益 Demo（免费调用）  
-> 🔗 链接：<https://business2api.openel.top>
->
-> 在线绘图预设测试 [https://chat.openel.top](https://chat.openel.top/)
-
-<img width="1880" height="919" alt="image" src="https://github.com/user-attachments/assets/d05d4b06-2c2a-468f-b8fb-fb6dad8dc3ab" />
-
-
->
-> > API Key 获取请访问 https://business2api.openel.top/auth 获取个人专属免费APIKEY
-
-
->> GLM 公益测试 API
-> 🔗 链接：<https://GLM.openel.top>
->
-> XiaoMi 网页逆向公益 API
-> 🔗 链接：[https://xiaomi.openel.top](https://xiaomi.openel.top/)
->
->  API Key : `sk-3d2f9b84e7f510b1a08f7b3d6c9a6a7f17fbbad5624ea29f22d9c742bf39c863`
-
-
+- 图片：
+  - `gemini-2.5-flash-image-landscape/portrait`
+  - `gemini-3.0-pro-image-landscape/portrait`
+  - `imagen-4.0-generate-preview-landscape/portrait`
+- 视频：
+  - `veo_3_1_t2v_fast_landscape/portrait`
+  - `veo_2_1_fast_d_15_t2v_landscape/portrait`
+  - `veo_2_0_t2v_landscape/portrait`
+  - `veo_3_1_i2v_s_fast_fl_landscape/portrait`
+  - `veo_2_1_fast_d_15_i2v_landscape/portrait`
+  - `veo_2_0_i2v_landscape/portrait`
+  - `veo_3_0_r2v_fast_landscape/portrait`
 
 ## 快速开始
 
-### 方式一：Docker 部署（推荐）
+### 方式一：仓库内 Docker Compose（推荐）
 
-#### 1. 使用 Docker Compose
-
-```bash
-# 创建目录
-mkdir business2api && cd business2api
-
-# 下载必要文件
-wget https://raw.githubusercontent.com/XxxXTeam/business2api/master/docker/docker-compose.yml
-wget https://raw.githubusercontent.com/XxxXTeam/business2api/master/config/config.json.example -O config.json
-
-# 编辑配置
-vim config.json
-
-# 创建数据目录
-mkdir data
-
-# 启动服务
-docker compose up -d
-```
-
-#### 2. 使用 Docker Run
+> 当前 `docker/docker-compose.yml` 使用 `build.context: ..`，必须在仓库目录运行，不适用于“只下载 compose 文件”场景。
 
 ```bash
-# 拉取镜像
-docker pull ghcr.io/xxxteam/business2api:latest
-
-# 创建配置文件
-wget https://raw.githubusercontent.com/XxxXTeam/business2api/master/config/config.json.example -O config.json
-
-# 运行容器
-docker run -d \
-  --name business2api \
-  -p 8000:8000 \
-  -v $(pwd)/data:/app/data \
-  -v $(pwd)/config.json:/app/config/config.json:ro \
-  ghcr.io/xxxteam/business2api:latest
-```
-
-### 方式二：二进制部署
-
-#### 1. 下载预编译版本
-
-从 [Releases](https://github.com/XxxXTeam/business2api/releases) 下载对应平台的二进制文件。
-
-```bash
-# Linux amd64
-wget https://github.com/XxxXTeam/business2api/releases/latest/download/business2api-linux-amd64.tar.gz
-tar -xzf business2api-linux-amd64.tar.gz
-chmod +x business2api-linux-amd64
-```
-
-#### 2. 从源码编译
-
-```bash
-# 需要 Go 1.24+
+# 1) 克隆仓库
 git clone https://github.com/XxxXTeam/business2api.git
 cd business2api
 
-# 编译
-go build -o business2api .
+# 2) 准备配置文件（程序读取 config/config.json）
+cp config/config.json.example config/config.json
 
-# 运行
-./business2api
+# 3) 准备数据目录
+mkdir -p data data/registrar-artifacts
+
+# 4) 如需鉴权，先设置 API_KEYS（逗号分隔）
+export API_KEYS="sk-your-api-key"
+
+# 5) 如需启用 python registrar，再设置：
+# export B2A_API_KEY="sk-your-api-key"
+# export MAIL_KEY="your-mail-key"
+
+# 6) 启动
+# 全部服务：business2api + registrar + selenium
+docker compose -f docker/docker-compose.yml up -d --build
 ```
 
-### 方式三：使用 Systemd 服务
+验证：
 
 ```bash
-# 创建服务文件
-sudo tee /etc/systemd/system/business2api.service << EOF
-[Unit]
-Description=Gemini Gateway Service
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-WorkingDirectory=/opt/business2api
-ExecStart=/opt/business2api/business2api
-Restart=always
-RestartSec=5
-Environment=LISTEN_ADDR=:8000
-Environment=DATA_DIR=/opt/business2api/data
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# 启动服务
-sudo systemctl daemon-reload
-sudo systemctl enable business2api
-sudo systemctl start business2api
+curl http://localhost:8000/health
+curl http://localhost:8000/v1/models -H "Authorization: Bearer sk-your-api-key"
 ```
 
----
+### 方式二：Docker Run（镜像运行）
+
+```bash
+docker pull ghcr.io/xxxteam/business2api:latest
+
+mkdir -p config data
+# 拉取示例配置并写入 config/config.json
+curl -fsSL \
+  https://raw.githubusercontent.com/XxxXTeam/business2api/master/config/config.json.example \
+  -o config/config.json
+
+docker run -d \
+  --name business2api \
+  -p 8000:8000 \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/config/config.json:/app/config/config.json:ro" \
+  -e API_KEYS="sk-your-api-key" \
+  ghcr.io/xxxteam/business2api:latest
+```
+
+### 方式三：源码本地运行
+
+```bash
+# 需要 Go 1.25+
+go mod download
+go run .
+
+# 调试模式
+go run . --debug
+```
+
+命令行参数：
+
+- `--debug` / `-d`：注册调试模式（截图输出到 `data/screenshots/`）
+- `--auto`：自动订阅代理模式
+- `--refresh [email]`：有头浏览器刷新账号后退出
+- `--help` / `-h`
 
 ## 配置说明
 
-### config.json
+主配置文件：`config/config.json`
+
+> 程序不会默认读取仓库根目录 `config.json`。
+
+示例（与 `config/config.json.example` 对齐）：
 
 ```json
 {
-  "api_keys": ["sk-your-api-key"],    // API 密钥列表，用于鉴权
-  "listen_addr": ":8000",              // 监听地址
-  "data_dir": "./data",                // 账号数据目录
-  "default_config": "",                // 默认 configId（可选）
-  "debug": false,                      // 调试模式（输出详细日志）
-  
+  "api_keys": [],
+  "listen_addr": ":8000",
+  "data_dir": "./data",
+  "default_config": "",
+  "debug": false,
   "pool": {
-    "target_count": 50,                // 目标账号数量
-    "min_count": 10,                   // 最小账号数，低于此值触发注册
-    "check_interval_minutes": 30,      // 检查间隔（分钟）
-    "enable_go_register": true,        // 是否启用 Go 内置注册
-    "register_threads": 1,             // 本地注册线程数
-    "register_headless": true,         // 无头模式注册
-    "mail_channel_order": ["chatgpt"], // 邮箱渠道优先级（可选: duckmail, chatgpt）
-    "duckmail_bearer": "",             // DuckMail Bearer（启用 duckmail 时必填）
-    "refresh_on_startup": true,        // 启动时刷新账号
-    "refresh_cooldown_sec": 240,       // 刷新冷却时间（秒）
-    "use_cooldown_sec": 15,            // 使用冷却时间（秒）
-    "max_fail_count": 3,               // 最大连续失败次数
-    "enable_browser_refresh": true,    // 启用浏览器刷新401账号
-    "browser_refresh_headless": true,  // 浏览器刷新无头模式
-    "browser_refresh_max_retry": 1,    // 浏览器刷新最大重试次数
-    "auto_delete_401": false,          // 401时自动删除账号
-    "external_refresh_mode": false     // 启用外部续期模式（Python registrar）
+    "target_count": 50,
+    "min_count": 10,
+    "check_interval_minutes": 30,
+    "enable_go_register": true,
+    "register_threads": 1,
+    "register_headless": true,
+    "mail_channel_order": ["chatgpt"],
+    "duckmail_bearer": "",
+    "refresh_on_startup": true,
+    "refresh_cooldown_sec": 240,
+    "use_cooldown_sec": 15,
+    "max_fail_count": 3,
+    "enable_browser_refresh": true,
+    "browser_refresh_headless": true,
+    "browser_refresh_max_retry": 1,
+    "external_refresh_mode": false,
+    "registrar_base_url": "http://127.0.0.1:8090"
   },
-
-  "pool_server": {                     
-    "enable": false,                   // 是否启用分离模式
-    "mode": "local",                   // 运行模式：local/server/client
-    "server_addr": "http://ip:8000",   // 服务器地址（client模式）
-    "listen_addr": ":8000",            // 监听地址（server模式）
-    "secret": "your-secret-key",       // 通信密钥
-    "target_count": 50,                // 目标账号数（server模式）
-    "client_threads": 2,               // 客户端并发线程数
-    "data_dir": "./data",              // 数据目录（server模式）
-    "expired_action": "delete"         // 过期账号处理：delete/refresh/queue
+  "pool_server": {
+    "enable": false,
+    "mode": "local",
+    "server_addr": "http://server-ip:8000",
+    "listen_addr": ":8000",
+    "secret": "",
+    "target_count": 50,
+    "client_threads": 2,
+    "data_dir": "./data",
+    "expired_action": "delete"
   },
-
   "proxy_pool": {
-    "subscribes": [],                  // 代理订阅链接列表
-    "files": [],                       // 本地代理文件列表
-    "health_check": true,              // 启用健康检查
-    "check_on_startup": true           // 启动时检查
+    "subscribes": ["http://example.com/s/example"],
+    "files": [],
+    "health_check": true,
+    "check_on_startup": true
+  },
+  "flow": {
+    "enable": false,
+    "tokens": [],
+    "timeout": 120,
+    "poll_interval": 3,
+    "max_poll_attempts": 500
   }
 }
 ```
 
-### 多 API Key 支持
+### 环境变量覆盖
 
-支持配置多个 API Key，所有 Key 都可以用于鉴权：
+Go 服务：
 
-```json
-{
-  "api_keys": [
-    "sk-key-1",
-    "sk-key-2", 
-    "sk-key-3"
-  ]
-}
-```
+- `LISTEN_ADDR`
+- `DATA_DIR`
+- `PROXY`
+- `CONFIG_ID`
+- `API_KEYS`（覆盖配置中的 `api_keys`，逗号分隔）
+- `API_KEY`（追加单个 key）
+- `POOL_SERVER_SECRET`
+- `DUCKMAIL_BEARER`
 
-### 配置热重载
+Python registrar：
 
-服务运行时自动监听 `config/config.json` 文件变更，无需重启即可生效。
+- `B2A_BASE_URL`（默认 `http://business2api:8000`）
+- `B2A_API_KEY`
+- `MAIL_API`
+- `MAIL_KEY`
+- `SELENIUM_REMOTE_URL`
+- `WORKER_ID`
+- `REFRESH_TASK_LEASE_SEC`
+- `CREDENTIALS_WAIT_TIMEOUT_SEC`
 
-**可热重载的配置项：**
+### 热重载
 
-| 配置项 | 说明 |
-|----------|------|
-| `api_keys` | API 密钥列表 |
-| `debug` | 调试模式 |
-| `pool.refresh_cooldown_sec` | 刷新冷却时间 |
-| `pool.use_cooldown_sec` | 使用冷却时间 |
-| `pool.max_fail_count` | 最大失败次数 |
-| `pool.enable_browser_refresh` | 浏览器刷新开关 | 
-| `pool.enable_go_register` | Go 注册开关 |
-| `pool.external_refresh_mode` | 外部续期开关 |
+服务会监听 `config/config.json` 的写入变更。典型可热更新项：
 
-**配置合并机制：** 配置文件中缺失的字段会自动使用默认值，无需手动同步示例文件。
+- `api_keys`
+- `debug`
+- `pool.refresh_cooldown_sec`
+- `pool.use_cooldown_sec`
+- `pool.max_fail_count`
+- `pool.enable_browser_refresh`
+- `pool.browser_refresh_headless`
+- `pool.browser_refresh_max_retry`
+- `pool.auto_delete_401`
+- `pool.enable_go_register`
+- `pool.external_refresh_mode`
+- `pool.mail_channel_order`
+- `pool.duckmail_bearer`
+- `pool.registrar_base_url`
+
+手动触发：
 
 ```bash
-# 手动触发重载
 curl -X POST http://localhost:8000/admin/reload-config \
   -H "Authorization: Bearer sk-your-api-key"
 ```
 
----
+## 运行模式与架构
 
-## C/S 分离架构
+### Local（默认）
 
-支持将号池管理与API服务分离部署，适用于多节点场景。
+- 单进程内运行 API + 账号池
+- 可选 Go 内置注册
+- 可选外部 registrar 续期
 
-### 架构说明
+### Server
 
-```
-┌─────────────────┐         ┌─────────────────┐
-│   API Server    │◄───────►│   Pool Server   │
-│   (客户端模式)   │   HTTP   │   (服务器模式)   │
-└─────────────────┘         └────────┬────────┘
-                                     │
-                            WebSocket│
-                                     │
-                            ┌────────▼────────┐
-                            │  Worker Client  │
-                            │  (注册/续期)     │
-                            └─────────────────┘
-```
+- 运行 API + 账号池调度中心
+- 暴露 `/ws` 给 Client 工作节点
+- 通过 `/pool/upload-account` 接收客户端上传结果
 
-### 运行模式
+### Client
 
-| 模式 | 说明 |
-|------|------|
-| `local` | 本地模式（默认），API服务和号池管理在同一进程 |
-| `server` | 服务器模式，提供号池服务和任务分发 |
-| `client` | 客户端模式，只接收任务（注册/续期），不提供API服务 |
+- 不提供 `/v1/*` API
+- 作为工作节点通过 WS 接收注册/续期任务
 
-### Server 模式配置
+## 管理面板
 
-```json
-{
-  "api_keys": ["sk-your-api-key"],
-  "listen_addr": ":8000",
-  "pool_server": {
-    "enable": true,
-    "mode": "server",
-    "secret": "shared-secret-key",
-    "target_count": 100,
-    "data_dir": "./data",
-    "expired_action": "delete"
-  }
-}
-```
+访问：`/admin/panel`
 
-### Client 模式配置（仅注册/续期工作节点）
+- 默认账号：`admin`
+- 默认密码：`admin123`
+- 密码文件：`data/admin_panel_auth.json`
+- 会话 cookie：`b2a_admin_session`（默认 TTL 12 小时）
 
-```json
-{
-  "pool_server": {
-    "enable": true,
-    "mode": "client",
-    "server_addr": "http://server-ip:8000",
-    "secret": "shared-secret-key",
-    "client_threads": 3
-  },
-  "proxy_pool": {
-    "subscribes": ["https://your-proxy-subscribe-url"],
-    "health_check": true,
-    "check_on_startup": true
-  }
-}
-```
+说明：`/admin/*` 支持两种鉴权方式：
 
-### 配置项说明
+1. API Key（`Authorization: Bearer ...`）
+2. 面板登录会话（cookie）
 
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `client_threads` | 客户端并发任务数 | 1 |
-| `expired_action` | 过期账号处理方式 | delete |
-
-**expired_action 可选值：**
-- `delete` - 删除过期账号
-- `refresh` - 尝试浏览器刷新
-- `queue` - 保留在队列等待重试
-
-**架构说明（v2.x）：**
-```
-┌─────────────────────────────────────────────────────┐
-│                   Server (:8000)                     │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │   API 服务   │  │   WS 服务   │  │  号池管理    │  │
-│  │ /v1/chat/*  │  │    /ws      │  │  Pool Mgr   │  │
-│  └─────────────┘  └──────┬──────┘  └─────────────┘  │
-└──────────────────────────┼──────────────────────────┘
-                           │ WebSocket
-              ┌────────────┼────────────┐
-              │            │            │
-        ┌─────▼─────┐ ┌────▼────┐ ┌─────▼─────┐
-        │  Client1  │ │ Client2 │ │  Client3  │
-        │  (注册)    │ │ (注册)   │ │  (注册)   │
-        └───────────┘ └─────────┘ └───────────┘
-```
-
-**Client 模式说明：**
-- 通过 WebSocket 连接 Server (`/ws`) 接收任务
-- 执行注册新账号任务
-- 执行401账号Cookie续期任务
-- 完成后自动回传账号数据到Server
-- **不提供API服务**，只作为工作节点
-
-### 环境变量
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `LISTEN_ADDR` | 监听地址 | `:8000` |
-| `DATA_DIR` | 数据目录 | `./data` |
-| `PROXY` | 代理地址 | - |
-| `API_KEY` | API 密钥 | - |
-| `CONFIG_ID` | 默认 configId | - |
-
----
-
-## API 使用
+## API 使用示例
 
 ### 获取模型列表
 
@@ -404,9 +303,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-api-key" \
   -d '{
     "model": "gemini-2.5-flash",
-    "messages": [
-      {"role": "user", "content": "Hello!"}
-    ],
+    "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'
 ```
@@ -419,287 +316,183 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-api-key" \
   -d '{
     "model": "gemini-2.5-flash",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "text", "text": "描述这张图片"},
-          {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-        ]
-      }
-    ]
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "描述这张图片"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+      ]
+    }]
   }'
 ```
 
----
+## Flow Token 使用
 
-## Flow 图片/视频生成
+启用前提：`flow.enable=true`
 
-Flow 集成了 Google VideoFX (Veo/Imagen) API，支持图片和视频生成。
-
-### 配置
-
-```json
-{
-  "flow": {
-    "enable": true,
-    "tokens": [],              // 配置文件中的 Token（可选）
-    "proxy": "",               // Flow 专用代理
-    "timeout": 120,            // 超时时间(秒)
-    "poll_interval": 3,        // 轮询间隔(秒)
-    "max_poll_attempts": 500   // 最大轮询次数
-  }
-}
-```
-
-### 获取 Flow Token
-
-**方式一：文件目录（推荐）**
-
-将完整的 cookie 字符串保存到 `data/at/` 目录下的任意 `.txt` 文件：
+### 推荐方式：文件注入
 
 ```bash
 mkdir -p data/at
 echo "your-cookie-string" > data/at/account1.txt
 ```
 
-服务启动时自动加载，支持文件监听自动热加载。
+程序会从 `data/at` 提取 `__Secure-next-auth.session-token` 并自动加载。
 
-**方式二：API 添加**
+### 管理接口方式
 
 ```bash
 curl -X POST http://localhost:8000/admin/flow/add-token \
-  -H "Authorization: Bearer sk-xxx" \
-  -d '{"cookie": "your-cookie-string"}'
+  -H "Authorization: Bearer sk-your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"cookie":"your-cookie-string"}'
 ```
 
-**Cookie 获取方法：**
-1. 访问 [labs.google/fx](https://labs.google/fx) 并登录
-2. 打开开发者工具 → Application → Cookies
-3. 复制所有 cookie 或 `__Secure-next-auth.session-token` 的值
-
-### Flow 模型列表
-
-| 模型 | 类型 | 说明 |
-|------|------|------|
-| `gemini-2.5-flash-image-landscape/portrait` | 图片 | Gemini 2.5 Flash 图片生成 |
-| `gemini-3.0-pro-image-landscape/portrait` | 图片 | Gemini 3.0 Pro 图片生成 |
-| `imagen-4.0-generate-preview-landscape/portrait` | 图片 | Imagen 4.0 图片生成 |
-| `veo_3_1_t2v_fast_landscape/portrait` | 视频 | Veo 3.1 文生视频 |
-| `veo_2_1_fast_d_15_t2v_landscape/portrait` | 视频 | Veo 2.1 文生视频 |
-| `veo_2_0_t2v_landscape/portrait` | 视频 | Veo 2.0 文生视频 |
-| `veo_3_1_i2v_s_fast_fl_landscape/portrait` | 视频 | Veo 3.1 图生视频 (I2V) |
-| `veo_2_1_fast_d_15_i2v_landscape/portrait` | 视频 | Veo 2.1 图生视频 (I2V) |
-| `veo_2_0_i2v_landscape/portrait` | 视频 | Veo 2.0 图生视频 (I2V) |
-| `veo_3_0_r2v_fast_landscape/portrait` | 视频 | Veo 3.0 多图生视频 (R2V) |
-
-### 使用示例
-
-```bash
-# 图片生成
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-xxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "gemini-2.5-flash-image-landscape", "messages": [{"role": "user", "content": "一只可爱的猫咪"}], "stream": true}'
-
-# 文生视频 (T2V)
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-xxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "veo_3_1_t2v_fast_landscape", "messages": [{"role": "user", "content": "猫咪在草地上追蝴蝶"}], "stream": true}'
-
-# 图生视频 (I2V) - 支持首尾帧
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-xxx" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "veo_3_1_i2v_s_fast_fl_landscape",
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "text", "text": "猫咪跳跃"},
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-      ]
-    }],
-    "stream": true
-  }'
-```
-
----
-
-## 🔧 常见问题与解决方案
-
-### 注册相关
-
-> **拟人化行为**：浏览器自动化已内置拟人化操作（随机延迟、贝塞尔曲线鼠标移动、自然打字节奏），以降低被检测风险。可通过 `register_headless: false` 开启可视模式观察行为。
-
-| 错误 | 原因 | 解决方案 |
-|------|------|----------|
-| `无法获取验证码邮件` | 临时邮箱服务不稳定或邮件延迟 | 代理遭到拉黑，更换代理 |
-| `panic: nil pointer` | 浏览器启动失败或页面未加载 | 检查 Chrome 是否安装，确保有足够内存 |
-| `找不到提交按钮` | 页面结构变化或加载超时 | 升级到最新版本，检查网络 |
-
-
-### API 相关
-
-| 错误 | 原因 | 解决方案 |
-|------|------|----------|
-| `401 Unauthorized` | API Key 无效或未配置 | 检查 `api_keys` 配置 |
-| `429 Too Many Requests` | 账号触发速率限制 | 增加账号池数量，调整 `use_cooldown_sec` |
-| `503 Service Unavailable` | 无可用账号 | 等待账号刷新或增加注册 |
-| `空响应` | Google 返回空内容 | 重试请求，检查 prompt 是否触发过滤 |
-
-### WebSocket 相关
-
-| 错误 | 原因 | 解决方案 |
-|------|------|----------|
-| `客户端频繁断开` | 心跳超时或网络不稳定 | 检查网络，确保 Server 和 Client 时间同步 |
-| `上传注册结果失败` | Server 端口或路径错误 | 确保 `server_addr` 指向正确地址 |
-
-### Flow 相关
-
-| 错误 | 原因 | 解决方案 |
-|------|------|----------|
-| `Flow 服务未启用` | 未配置或 Token 为空 | 检查 `flow.enable` 和 `flow.tokens` |
-| `Token 认证失败` | ST Token 过期 | 重新获取 Token |
-| `视频生成超时` | 生成时间过长 | 增加 `max_poll_attempts` |
-
-### Docker 相关
-
-| 错误 | 原因 | 解决方案 |
-|------|------|----------|
-| `无法启动浏览器` | Docker 容器缺少 Chrome | 使用包含 Chrome 的镜像或挂载主机浏览器 |
-| `权限被拒绝` | 数据目录权限问题 | `chown -R 1000:1000 ./data` |
-
----
-
-## 📡 API 端点一览
+## API 端点总览
 
 ### 公开端点
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/` | GET | 服务状态和信息 |
-| `/health` | GET | 健康检查 |
-| `/ws` | WS | WebSocket 端点 (Server 模式) |
+- `GET /`
+- `GET /health`
+- `GET /admin/panel`
+- `GET /admin/panel/assets/*filepath`
+- `POST /admin/panel/login`
+- `POST /admin/panel/logout`
+- `GET /admin/panel/me`
+- `POST /admin/panel/change-password`（需登录会话）
+- `GET /ws`（仅 server 模式）
 
-### API 端点（需要 API Key）
+### 业务端点（API Key）
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/models` | GET | OpenAI 格式模型列表 |
-| `/v1/chat/completions` | POST | OpenAI 格式聊天补全 |
-| `/v1/messages` | POST | Claude 格式消息 |
-| `/v1beta/models` | GET | Gemini 格式模型列表 |
-| `/v1beta/models/:model` | GET | Gemini 格式模型详情 |
-| `/v1beta/models/:model:generateContent` | POST | Gemini 格式生成内容 |
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/messages`
+- `GET /v1beta/models`
+- `GET /v1beta/models/:model`
+- `POST /v1beta/models/*action`
+- `POST /v1/models/*action`
 
-### 管理端点（需要 API Key）
+### 管理端点（API Key 或 Session）
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/admin/status` | GET | 账号池状态 |
-| `/admin/stats` | GET | 详细 API 统计 |
-| `/admin/ip` | GET | IP 遥测统计（请求数/Token/RPM） |
-| `/admin/register` | POST | 触发注册 |
-| `/admin/refresh` | POST | 刷新账号池 |
-| `/admin/reload-config` | POST | 热重载配置文件 |
-| `/admin/force-refresh` | POST | 强制刷新所有账号 |
-| `/admin/config/cooldown` | POST | 动态调整冷却时间 |
-| `/admin/browser-refresh` | POST | 手动触发浏览器刷新指定账号 |
-| `/admin/config/browser-refresh` | POST | 配置浏览器刷新开关 |
-| `/admin/flow/status` | GET | Flow 服务状态 |
-| `/admin/flow/add-token` | POST | 添加 Flow Token |
-| `/admin/flow/remove-token` | POST | 移除 Flow Token |
-| `/admin/flow/reload` | POST | 重新加载 Flow Token |
+- `POST /admin/register`
+- `POST /admin/refresh`
+- `GET /admin/status`
+- `GET /admin/stats`
+- `GET /admin/ip`
+- `POST /admin/force-refresh`
+- `POST /admin/reload-config`
+- `POST /admin/config/cooldown`
+- `POST /admin/browser-refresh`
+- `POST /admin/config/browser-refresh`
+- `GET /admin/accounts`
+- `GET /admin/pool-files`
+- `GET /admin/pool-files/export`
+- `POST /admin/pool-files/import`
+- `POST /admin/pool-files/delete-invalid/preview`
+- `POST /admin/pool-files/delete-invalid/execute`
+- `GET /admin/logs/stream`
+- `POST /admin/registrar/upload-account`
+- `GET /admin/registrar/refresh-tasks`（兼容旧版）
+- `POST /admin/registrar/refresh-tasks/claim`
+- `POST /admin/registrar/refresh-tasks/fail`
+- `GET /admin/registrar/metrics`
+- `POST /admin/registrar/trigger-register`
+- `GET /admin/flow/status`
+- `POST /admin/flow/add-token`
+- `POST /admin/flow/remove-token`
+- `POST /admin/flow/reload`
 
----
+### 内部端点（Pool Secret）
 
-## 🛠️ 开发
+- `POST /pool/upload-account`
 
-### 本地运行
+当 `pool_server.secret` 非空时，需携带请求头：`X-Pool-Secret`。
+
+## Python Registrar（外部注册/续期）
+
+目录：`python/registrar`
+
+对外接口：
+
+- `GET /health`
+- `GET /metrics`
+- `POST /trigger/register?count=1`
+- `POST /trigger/refresh?limit=20`
+- `GET /logs`
+
+在 Go 服务中通过 `pool.registrar_base_url` 配置 registrar 地址，管理端可用：
+
+- `POST /admin/registrar/trigger-register`
+- `GET /admin/logs/stream?source=registrar`
+
+## 开发与测试
+
+### 本地测试
 
 ```bash
-# 安装依赖
-go mod download
+# 运行单元测试
+go test ./...
 
-# 运行
-go run .
+# 仅跑管理端相关测试
+go test -run TestAdmin ./...
 
-# 调试模式
-go run . -d
+# 快速接口冒烟
+./test-api.sh
 ```
 
 ### 构建
 
 ```bash
-# 标准构建
 go build -o business2api .
-
-# 带 QUIC/uTLS 支持（推荐）
 go build -tags "with_quic with_utls" -o business2api .
-
-# 生产构建（压缩体积）
-CGO_ENABLED=0 go build -ldflags="-s -w" -tags "with_quic with_utls" -o business2api .
-
-# 多平台构建
-GOOS=linux GOARCH=amd64 go build -tags "with_quic with_utls" -o business2api-linux-amd64 .
-GOOS=windows GOARCH=amd64 go build -tags "with_quic with_utls" -o business2api-windows-amd64.exe .
-GOOS=darwin GOARCH=arm64 go build -tags "with_quic with_utls" -o business2api-darwin-arm64 .
 ```
 
-### 项目结构
+## 项目结构
 
-```
+```text
 .
-├── main.go              # 主程序入口
-├── config/              # 配置文件
+├── main.go
+├── config/
+│   ├── config.json
 │   ├── config.json.example
 │   └── README.md
 ├── src/
-│   ├── flow/            # Flow 图片/视频生成
-│   ├── logger/          # 日志模块
-│   ├── pool/            # 账号池管理（C/S架构）
-│   ├── proxy/           # 代理池管理
-│   ├── register/        # 浏览器自动注册
-│   └── utils/           # 工具函数
-├── docker/              # Docker 相关
-│   └── docker-compose.yml
-└── .github/             # GitHub Actions
+│   ├── adminauth/
+│   ├── adminlogs/
+│   ├── flow/
+│   ├── logger/
+│   ├── pool/
+│   ├── proxy/
+│   ├── register/
+│   └── utils/
+├── python/registrar/
+├── web/admin/
+├── docker/docker-compose.yml
+└── test-api.sh
 ```
 
----
+## 常见问题
 
-## 📊 IP 遥测接口
+### 1) 为什么改了根目录 `config.json` 不生效？
 
-访问 `/admin/ip` 获取全部 IP 请求统计：
+程序读取的是 `config/config.json`，请修改该文件。
+
+### 2) 为什么“只下载 docker-compose.yml”后启动失败？
+
+仓库中的 `docker/docker-compose.yml` 依赖仓库源码进行构建（`build.context: ..`），需在仓库目录运行。
+
+### 3) 为什么调用 `/v1/chat/completions` 返回 503？
+
+通常是账号池暂无可用账号，可查看：
 
 ```bash
-curl http://localhost:8000/admin/ip \
-  -H "Authorization: Bearer sk-your-api-key"
+curl http://localhost:8000/admin/status -H "Authorization: Bearer sk-your-api-key"
 ```
 
-**返回字段说明：**
+### 4) 管理面板如何重置密码？
 
-| 字段 | 说明 |
-|------|------|
-| `unique_ips` | 独立 IP 数量 |
-| `total_requests` | 总请求数 |
-| `total_tokens` | 总 Token 消耗 |
-| `total_images` | 图片生成数 |
-| `total_videos` | 视频生成数 |
-| `ips[].rpm` | 单 IP 每分钟请求数 |
-| `ips[].input_tokens` | 输入 Token |
-| `ips[].output_tokens` | 输出 Token |
-| `ips[].models` | 各模型使用次数 |
+删除 `data/admin_panel_auth.json` 后重启，系统会重建默认账号 `admin/admin123`。
 
----
+## License
 
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=XxxXTeam/business2api&type=date&legend=top-left)](https://www.star-history.com/#XxxXTeam/business2api&type=date&legend=top-left)
-
-## 📄 License
-
-MIT License
+MIT

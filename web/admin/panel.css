@@ -290,6 +290,10 @@ textarea {
   gap: 10px;
 }
 
+.registrar-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .stat-card {
   min-height: 110px;
   display: flex;

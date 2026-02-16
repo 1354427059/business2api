@@ -119,3 +119,22 @@ socks5://127.0.0.1:1080
   "proxy": "http://127.0.0.1:10808" // 全局代理 (兼容旧配置)
 }
 ```
+
+---
+
+## 敏感项环境变量覆盖（推荐）
+
+为避免在 `config.json` 明文存储密钥，支持以下环境变量覆盖：
+
+- `API_KEYS`：逗号分隔，会覆盖 `api_keys`
+- `API_KEY`：追加单个 API Key
+- `POOL_SERVER_SECRET`：覆盖 `pool_server.secret`
+- `DUCKMAIL_BEARER`：覆盖 `pool.duckmail_bearer`
+
+Python registrar 相关密钥也应走环境变量注入：
+
+- `B2A_API_KEY`
+- `MAIL_KEY`（必填，不再提供弱默认值）
+- `WORKER_ID`
+- `REFRESH_TASK_LEASE_SEC`
+- `CREDENTIALS_WAIT_TIMEOUT_SEC`
